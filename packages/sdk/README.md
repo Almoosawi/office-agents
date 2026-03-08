@@ -242,8 +242,8 @@ const promptSection = buildSkillsPromptSection(skills);
 
 ## Used By
 
-- **[@office-agents/excel](https://github.com/hewliyang/open-excel/tree/main/packages/excel)** — Excel Add-in with AI chat
-- **[@office-agents/powerpoint](https://github.com/hewliyang/open-excel/tree/main/packages/powerpoint)** — PowerPoint Add-in with AI chat
+- **[@office-agents/excel](https://github.com/hewliyang/office-agents/tree/main/packages/excel)** — Excel Add-in with AI chat
+- **[@office-agents/powerpoint](https://github.com/hewliyang/office-agents/tree/main/packages/powerpoint)** — PowerPoint Add-in with AI chat
 
 ## License
 
