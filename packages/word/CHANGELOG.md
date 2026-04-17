@@ -5,6 +5,7 @@
 ### Changed
 
 - **Co-located command prompt snippets** — System prompt assembles command docs dynamically from `DescribedCommand` snippets instead of hard-coding them.
+- **Upgrade `pi-ai` / `pi-agent-core`** — Bumped to `^0.67.6` for the latest provider, streaming, and agent runtime improvements.
 
 ## [0.0.3] - 2026-03-19
 
