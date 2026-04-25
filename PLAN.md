@@ -7,6 +7,7 @@ Pair with `ARCHITECTURE.md`. This file is the build sequence.
 > - r3 (2026-04-25): added hard constraint **"no admin privileges, ever"**. Replaced MSI installer with per-user portable install. Cert handling moved to `Cert:\CurrentUser\*` only. All registry writes restricted to `HKCU`. Junction-only (no symlinks). See `ARCHITECTURE.md §1a`.
 > - r4 (2026-04-25): GPT review fixes — (a) build scripts no longer use `rm -rf` (junction-safe `scripts/clean-build-outputs.cjs`); (b) ARCHITECTURE.md `§12` no longer references Wix MSI / Windows service; (c) PLAN.md self-review #1 no longer says "EWS first" (now Graph-primary on M365, EWS only on on-prem); (d) CLI adapter table is strict text-only with `<office_tool>` markers (no `tool_use` -> `tool_call` mapping in v1); (e) `protocol.ts` default host pinned to `127.0.0.1` (was `localhost`); (f) memory layer extended with claude-mem-inspired observations / session_summaries / FTS5 search and privacy controls (method only — no AGPL code copied).
 > - r5 (2026-04-25): added **local-LLM provider lane** (Ollama, LMStudio, vLLM, llama.cpp, generic OpenAI-compatible) with auto-discovery of available models. Added **per-provider config**: model, base_url, temperature, top_p, max_tokens, system_prompt_override. Added **install checkpoints** per sprint so the user knows exactly when sideload becomes useful at each stage.
+> - r6 (2026-04-25): **hybrid provider routing** — Sprint 1 module 2 lands C-first (spawn `claude`/`codex`/`gemini`) with **A-fallback** to a bundled CLIProxyAPI sidecar (`router-for-me/CLIProxyAPI`, MIT, Go binary). The sidecar reuses the CLIs' OAuth tokens to call cloud APIs directly — same providers, but no per-call process spawn and full streaming/tool/multimodal feature parity. User picks which provider in the Settings UI; the router walks `entry.fallbacks[]` on probe failure. The 3 separate `cli-claude.ts`/`cli-codex.ts`/`cli-gemini.ts` files collapsed into one `providers/cli.ts` with per-binary detection. Added `providers/sidecar.ts`, `providers/local.ts`, `providers/openai-compat.ts` (shared HTTP), `providers/router.ts`. Added an **orchestrator role** hook (`role: 'main' | 'orchestrator' | 'background'`) on `ProviderEntry` plus typed `OrchestratorJob` envelope (json/markdown/yaml body) — foundation only; the dispatcher lands in Sprint 2.
 
 ---
 
@@ -53,9 +54,8 @@ I will explicitly call out "**INSTALLABLE NOW** — try `<command>`" each time a
 
 Add to `packages/bridge/src/`:
 
-- `providers/cli-claude.ts` — spawn `claude` in **text-only completion mode** (`--print` non-interactive, no `--mcp-config`, no allowed tools). Parse plain-text/stream-text stdout.
-- `providers/cli-codex.ts` — spawn `codex` in **text-only mode** (no agent loop, no shell tools). Whichever flag combination on `codex 0.117.0` disables its agentic tool execution — Sprint 1 first task is `codex exec --help` to confirm flag names.
-- `providers/cli-gemini.ts` — spawn `gemini` in **text-only mode** (no built-in tool execution).
+- `providers/cli.ts` — single adapter for `claude`/`codex`/`gemini`, with binary detection (`detectCli()`) and per-CLI flag building (`buildCliInvocation()`). All three run in **text-only completion mode**: `claude --bare --print --input-format=stream-json --output-format=stream-json` (messages on stdin), `codex exec --sandbox read-only` (flat-text stdin), `gemini --prompt " " --output-format=stream-json --approval-mode plan` (real prompt on stdin, single-space `--prompt` keeps headless mode active). Windows shell quirk: `claude.exe` is a real binary (`shell:false`); `codex.cmd`/`gemini.cmd` are npm shims so spawn falls back to `shell:true` whenever the command isn't an explicit `.exe`. User-controlled prose never reaches argv — model name + flag values are whitelisted (`/^[A-Za-z0-9._\-:/=+]*$/`), prompts go via stdin only.
+- `providers/sidecar.ts` — A-fallback adapter. Talks to the bundled CLIProxyAPI binary on `http://127.0.0.1:7860/api/provider/{claude|codex|gemini}/v1` (OpenAI-compatible). The user enables this in Settings; the router auto-falls-back to it from the `cli:*` entries via `entry.fallbacks[]`. The Go binary ships in the per-user installer (no admin) and runs in the user session — same lifecycle pattern as the planned outlook-com sidecar. CLIProxyAPI reuses the CLIs' OAuth tokens, so once the user has logged into `claude`/`codex`/`gemini` once, the sidecar works without further auth.
 
 **Critical:** CLI adapters NEVER use the CLI's native tool system in v1. Each CLI is treated as a pure text-completion endpoint. Tool calls are extracted from the model's plain-text output via a custom marker protocol the system prompt instructs the model to emit:
 
@@ -66,26 +66,38 @@ Add to `packages/bridge/src/`:
 ```
 
 The bridge parses these markers, dispatches them via WSS `tool.invoke` to the taskpane (where Office.js executes), pushes the result back as `tool.result`, and continues the conversation. This guarantees Office tools are the ONLY tools — claude/codex/gemini cannot reach the filesystem, shell, or web on their own. v2 may upgrade individual CLIs to native tool calling with a constrained MCP server, but only after this boundary is rock-solid.
-- `providers/oauth-anthropic.ts` — already in fork; verify
-- `providers/oauth-codex.ts` — already in fork; verify
-- `providers/byok.ts` — generic OpenAI-compatible (also covers local LLMs — see below)
-- `providers/local-llm.ts` — convenience presets for **Ollama** (`http://127.0.0.1:11434/v1`), **LMStudio** (`http://127.0.0.1:1234/v1`), **vLLM** (`http://127.0.0.1:8000/v1`), **llama.cpp server** (`http://127.0.0.1:8080/v1`), and **custom OpenAI-compatible**. Each preset uses the OpenAI-compatible chat completions surface; the model dropdown is auto-populated by hitting `GET <base_url>/models` on the chosen base_url.
-- `providers/router.ts` — single `selectProvider()` based on settings + health
+- `providers/openai-compat.ts` — shared HTTP client used by `sidecar`, `local`, and (later) `byok`. Wraps `GET /models` (probe + listModels) and `POST /chat/completions` (SSE streaming). Inject-friendly via `fetchFn`.
+- `providers/oauth-anthropic.ts` — upstream fork already has this; verify when wiring BYOK in module 4.
+- `providers/oauth-codex.ts` — same.
+- `providers/byok.ts` *(deferred to module 4)* — direct cloud calls with a user-supplied key. Uses `openai-compat.ts`.
+- `providers/local.ts` — local OpenAI-compatible servers. Default registry presets ship for **Ollama** (`http://127.0.0.1:11434/v1`), **LMStudio** (`http://127.0.0.1:1234/v1`), with vLLM/llama.cpp/custom addable from Settings. Model dropdown auto-populates from `GET <base_url>/models`.
+- `providers/registry.ts` — user-editable registry stored as JSON in the memory DB `settings` table (`scope=providers`, `key=registry`). Ships with 8 default entries (3 CLI + 3 sidecar fallbacks + Ollama + LMStudio). CRUD: `load() / save() / get(id) / upsert() / remove() / enabled() / resetToDefaults()`.
+- `providers/router.ts` — `ProviderRouter.resolve(id)` returns `{ requested, chosen, chosenAdapter, probe, fallbackUsed, attempts }`. On primary probe failure, walks `entry.fallbacks[]` in order, skipping disabled fallbacks. Throws a structured error when the chain is exhausted so the UI can render "no available provider for X; tried N: …".
+- `providers/orchestrator.ts` *(types only — dispatcher in Sprint 2)* — `OrchestratorJob` envelope (`{ job_type, job_id, preferred_provider?, timeout_ms?, body: { format: 'json'|'markdown'|'yaml', … }, expected_schema? }`) and `OrchestratorResult`. The role hook on `ProviderEntry` already lets the user mark a fast/cheap provider as `role: 'orchestrator'`; the dispatcher will pick from those when the main provider hands off small structured jobs.
 
-**Per-provider config schema** (stored in `settings` table, scope `provider:<id>`):
+**Per-provider config schema** (stored in `settings` table, scope `providers`, key `registry` — single JSON array of all entries; the `ProviderRegistry` class owns CRUD):
 
 ```ts
-interface ProviderConfig {
-  id: string;                          // 'cli:claude' | 'cli:codex' | 'cli:gemini' | 'byok:openai' | 'local:ollama' | 'local:lmstudio' | 'local:vllm' | 'local:llamacpp' | 'local:custom'
-  kind: 'cli' | 'oauth' | 'byok' | 'local';
-  model?: string;                      // e.g. 'llama3.2:latest', 'qwen2.5-coder:32b' (Ollama uses ':tag' format)
-  base_url?: string;                   // for local/byok kinds
-  temperature?: number;                // 0.0..2.0, default 0.7 (UI clamps; per-model tighter ranges via tooltip)
-  top_p?: number;                      // optional, 0..1, default 1.0
-  max_tokens?: number;                 // optional, hard cap per response
-  system_prompt_override?: string;     // appended AFTER persona + skill prompts, before the user message; leave empty to inherit only persona
-  api_key_ref?: string;                // OS-keychain reference for byok providers; never plaintext in DB
+interface ProviderEntry {
+  id: string;                          // 'cli:claude' | 'cli:codex' | 'cli:gemini'
+                                       // | 'sidecar:cliproxy:claude' | 'sidecar:cliproxy:codex' | 'sidecar:cliproxy:gemini'
+                                       // | 'local:ollama' | 'local:lmstudio'
+                                       // | 'byok:openai' | 'byok:anthropic' | … (user-addable)
+  kind: 'cli' | 'sidecar' | 'local' | 'byok';
+  label: string;                       // UI label
   enabled: boolean;
+  command?: string;                    // kind=cli: 'claude' | 'codex' | 'gemini' (or full path)
+  base_url?: string;                   // kind=sidecar/local/byok: HTTP base
+  api_key_ref?: string;                // kind=byok: OS-keychain reference; never plaintext in DB
+  model?: string;                      // selected model id
+  temperature?: number;                // 0.0..2.0
+  top_p?: number;                      // 0..1
+  max_tokens?: number;
+  system_prompt_override?: string;     // appended AFTER persona + skill prompts
+  priority?: number;                   // lower wins in the picker
+  fallbacks?: string[];                // provider ids to try if this one's probe() fails
+  role?: 'main' | 'orchestrator' | 'background';  // foundation hook for the orchestrator (Sprint 2)
+  extra?: Record<string, unknown>;     // per-kind hints (e.g. { upstream: 'claude' } on sidecar)
 }
 ```
 

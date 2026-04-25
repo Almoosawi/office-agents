@@ -13,6 +13,7 @@
     ".": "./src/index.ts",
     "./client": "./src/client.ts",
     "./protocol": "./src/protocol.ts",
+    "./providers": "./src/providers/index.ts",
     "./server": "./src/server.ts"
   },
   "publishConfig": {
@@ -33,6 +34,10 @@
       "./protocol": {
         "types": "./dist/protocol.d.ts",
         "import": "./dist/protocol.js"
+      },
+      "./providers": {
+        "types": "./dist/providers/index.d.ts",
+        "import": "./dist/providers/index.js"
       },
       "./server": {
         "types": "./dist/server.d.ts",
