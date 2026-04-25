@@ -31,6 +31,10 @@ import {
   serializeForJson,
   toBridgeError,
 } from "./protocol.js";
+import {
+  handleProvidersRoute,
+  type ProvidersHttpDeps,
+} from "./providers/http-routes.js";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -59,6 +63,12 @@ export interface BridgeServerOptions {
   eventLimit?: number;
   requestTimeoutMs?: number;
   logger?: Pick<Console, "log" | "warn" | "error">;
+  /**
+   * Optional provider registry + router. When supplied, the server mounts
+   * `/api/providers/*` REST endpoints. Without it, those routes 404 — the
+   * bridge can run in pure session-RPC mode for tests / legacy callers.
+   */
+  providers?: ProvidersHttpDeps;
 }
 
 export interface BridgeServerHandle {
@@ -185,7 +195,10 @@ export async function createBridgeServer(
     async (req, res) => {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      res.setHeader(
+        "Access-Control-Allow-Methods",
+        "GET,POST,PUT,DELETE,OPTIONS",
+      );
 
       if (req.method === "OPTIONS") {
         res.statusCode = 204;
@@ -205,6 +218,17 @@ export async function createBridgeServer(
       const pathname = url.pathname;
 
       try {
+        if (options.providers) {
+          const handled = await handleProvidersRoute(
+            req,
+            res,
+            pathname,
+            options.providers,
+            { readJson: readJsonBody, writeJson: jsonResponse },
+          );
+          if (handled) return;
+        }
+
         if (req.method === "GET" && pathname === "/health") {
           jsonResponse(res, 200, {
             ok: true,

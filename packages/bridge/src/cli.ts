@@ -410,9 +410,38 @@ async function commandServe(cli: Cli) {
     "http",
   );
 
+  // Open the persistent memory DB and stand up the provider registry/router
+  // so /api/providers/* routes are available. If this fails (corrupt DB,
+  // permissions, etc.), the bridge still serves session RPC — provider
+  // routes just won't be mounted.
+  let providersDeps: import("./server.js").BridgeServerOptions["providers"];
+  try {
+    const { openMemoryDb } = await import("./memory/db.js");
+    const { MemoryRepository } = await import("./memory/repository.js");
+    const { ProviderRegistry } = await import("./providers/registry.js");
+    const { ProviderRouter } = await import("./providers/router.js");
+    const { createSidecarAdapter } = await import("./providers/sidecar.js");
+    const db = openMemoryDb();
+    const repo = new MemoryRepository(db);
+    const registry = new ProviderRegistry(repo);
+    // Sidecar adapter without a key supplier yet — the CliProxyManager
+    // is started lazily by the user (or a future auto-spawn-on-enable
+    // hook). Until then, sidecar probes return 401 / unavailable, which
+    // is the correct UX.
+    const router = new ProviderRouter({
+      registry,
+      adapters: { sidecar: createSidecarAdapter() },
+    });
+    providersDeps = { registry, router };
+  } catch (e) {
+    console.warn(
+      `[bridge] provider routes disabled: ${(e as Error).message}`,
+    );
+  }
+
   let server: BridgeServerHandle | null = null;
   try {
-    server = await createBridgeServer({ host, port });
+    server = await createBridgeServer({ host, port, providers: providersDeps });
   } catch (error) {
     if (
       error instanceof Error &&
