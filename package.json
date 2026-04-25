@@ -43,7 +43,9 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "esbuild"
+      "esbuild",
+      "better-sqlite3",
+      "keytar"
     ]
   }
 }

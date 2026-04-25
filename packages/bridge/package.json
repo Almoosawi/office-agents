@@ -54,7 +54,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "node ../../scripts/clean-build-outputs.cjs --dirs dist --files tsconfig.build.tsbuildinfo && tsc -p tsconfig.build.json",
+    "build": "node ../../scripts/clean-build-outputs.cjs --dirs dist --files tsconfig.build.tsbuildinfo && tsc -p tsconfig.build.json && node ../../scripts/copy-bridge-resources.cjs",
     "cli": "pnpm build && node dist/cli.js",
     "start": "pnpm build && node dist/cli.js serve",
     "prepublishOnly": "pnpm build",
@@ -62,5 +62,8 @@
   },
   "dependencies": {
     "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=22.5.0"
   }
 }

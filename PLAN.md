@@ -93,7 +93,7 @@ interface ProviderConfig {
 - Provider list with enable toggle + "Set as default"
 - Per-provider drawer: model picker (auto-populated from `/v1/models` for local/byok; fixed for CLI), temperature slider 0.0–2.0 (step 0.1), top_p (advanced), max_tokens (advanced), system_prompt_override textarea ("Appended to persona — leave empty to use only persona + skills")
 - For local LLMs: "Test connection" button hits `GET <base_url>/models` and lists discovered models with sizes
-- `memory/db.ts` — SQLite via `better-sqlite3`; WAL mode; FTS5 module; migrations in `memory/migrations/`
+- `memory/db.ts` — SQLite via Node 24's built-in `node:sqlite` (zero native deps; better-sqlite3 was rejected because its node-gyp fallback needs MSVC Build Tools = admin install, violating §1a). WAL mode, FTS5 enabled, migrations in `memory/migrations/`.
 - `memory/sessions.ts`, `memory/messages.ts`, `memory/facts.ts`, `memory/settings.ts`, `memory/handles.ts`, `memory/skill_state.ts`, `memory/observations.ts`, `memory/summaries.ts`
 - `memory/search.ts` — FTS5 query layer (single surface across observations + messages + summaries + facts), auto-skips `is_private=1`
 - `memory/privacy.ts` — `<private>...</private>` parser, redaction pipeline, retention sweep (sends expired rows to OS Recycle Bin, never permanent delete per global rule #0)
