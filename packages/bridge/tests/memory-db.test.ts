@@ -1,34 +1,35 @@
 // Smoke test for the memory layer: schema applies, basic inserts work,
 // FTS5 search round-trips, privacy flag suppresses indexing.
+//
+// Uses an in-memory SQLite (`:memory:`) so the test never touches the
+// filesystem — no tmpdir, no permanent deletion (rule #0), no leftover
+// artifacts inside OneDrive between runs.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { openMemoryDb, closeMemoryDb } from "../src/memory/db.js";
 import { MemoryRepository } from "../src/memory/repository.js";
 
-let tmp: string;
 let db: DatabaseSync;
 let repo: MemoryRepository;
 
 beforeEach(() => {
-	tmp = mkdtempSync(join(tmpdir(), "office-ai-mem-"));
-	db = openMemoryDb({ dbPath: join(tmp, "test.db") });
+	db = openMemoryDb({ dbPath: ":memory:" });
 	repo = new MemoryRepository(db);
 });
 
 afterEach(() => {
 	db.close();
 	closeMemoryDb();
-	rmSync(tmp, { recursive: true, force: true });
 });
 
 describe("memory schema", () => {
-	it("applies migrations and records version 1", () => {
-		const row = db.prepare("SELECT version FROM _schema_versions").get() as { version: number };
-		expect(row.version).toBe(1);
+	it("applies migrations and records latest version", () => {
+		const row = db
+			.prepare("SELECT MAX(version) AS v FROM _schema_versions")
+			.get() as { v: number };
+		// 0001_init.sql + 0002_fts_lifecycle.sql -> latest = 2
+		expect(row.v).toBeGreaterThanOrEqual(2);
 	});
 
 	it("creates sessions, messages, observations and queries them", () => {
@@ -71,6 +72,56 @@ describe("memory schema", () => {
 
 		const privateHits = repo.search({ query: "Confidential salary" });
 		expect(privateHits).toHaveLength(0);
+	});
+
+	it("timeline excludes private observations by default and includes them with opt-in", () => {
+		const session = repo.createSession({ host: "outlook", provider: "cli:claude" });
+		repo.insertObservation({
+			sessionId: session.id,
+			kind: "chat.send",
+			sourceHost: "outlook",
+			payload: { route: "user-input" },
+		});
+		repo.insertObservation({
+			sessionId: session.id,
+			kind: "chat.send",
+			sourceHost: "outlook",
+			payload: { secret: "redactable" },
+			isPrivate: true,
+		});
+
+		const safe = repo.timeline({ sessionId: session.id });
+		expect(safe).toHaveLength(1);
+		expect(safe[0]?.is_private).toBe(0);
+
+		const all = repo.timeline({ sessionId: session.id, includePrivate: true });
+		expect(all).toHaveLength(2);
+	});
+
+	it("FTS lifecycle: deleting a message purges its FTS row", () => {
+		const session = repo.createSession({ host: "word", provider: "cli:claude" });
+		const m = repo.insertMessage({
+			sessionId: session.id,
+			role: "user",
+			content: "Quick brown fox jumps over.",
+		});
+		expect(repo.search({ query: "quick brown" })).not.toHaveLength(0);
+
+		db.prepare("DELETE FROM messages WHERE id = ?").run(m.id);
+		expect(repo.search({ query: "quick brown" })).toHaveLength(0);
+	});
+
+	it("FTS lifecycle: flipping is_private=1 removes the row from FTS", () => {
+		const session = repo.createSession({ host: "word", provider: "cli:claude" });
+		const m = repo.insertMessage({
+			sessionId: session.id,
+			role: "user",
+			content: "Sphinx of black quartz.",
+		});
+		expect(repo.search({ query: "sphinx" })).not.toHaveLength(0);
+
+		db.prepare("UPDATE messages SET is_private = 1 WHERE id = ?").run(m.id);
+		expect(repo.search({ query: "sphinx" })).toHaveLength(0);
 	});
 
 	it("facts upsert by (scope, key) and round-trip", () => {

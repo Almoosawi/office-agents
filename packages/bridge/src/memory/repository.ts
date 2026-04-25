@@ -168,9 +168,16 @@ export class MemoryRepository {
 		since?: number;
 		until?: number;
 		limit?: number;
+		// Privacy default: exclude is_private=1 rows so the model-callable
+		// `memory.timeline` tool can't leak private observations. Admin/UI
+		// callers that need everything must opt in explicitly.
+		includePrivate?: boolean;
 	}): ObservationRow[] {
 		const where: string[] = [];
 		const params: (string | number)[] = [];
+		if (!args.includePrivate) {
+			where.push("is_private = 0");
+		}
 		if (args.sessionId) {
 			where.push("session_id = ?");
 			params.push(args.sessionId);

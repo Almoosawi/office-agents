@@ -84,7 +84,7 @@ interface ProviderConfig {
   top_p?: number;                      // optional, 0..1, default 1.0
   max_tokens?: number;                 // optional, hard cap per response
   system_prompt_override?: string;     // appended AFTER persona + skill prompts, before the user message; leave empty to inherit only persona
-  api_key_ref?: string;                // keytar key for byok providers; never plaintext in DB
+  api_key_ref?: string;                // OS-keychain reference for byok providers; never plaintext in DB
   enabled: boolean;
 }
 ```
@@ -98,7 +98,7 @@ interface ProviderConfig {
 - `memory/search.ts` — FTS5 query layer (single surface across observations + messages + summaries + facts), auto-skips `is_private=1`
 - `memory/privacy.ts` — `<private>...</private>` parser, redaction pipeline, retention sweep (sends expired rows to OS Recycle Bin, never permanent delete per global rule #0)
 - `memory/summarizer.ts` — periodic background pass that turns long sessions into `session_summaries` with citation IDs; runs only when conversation idle > 60s
-- `secrets/keychain.ts` — `keytar` wrapper, namespace `office-ai-assistant`
+- `secrets/keychain.ts` — OS-keychain wrapper, namespace `office-ai-assistant`. Backend is **decision-pending** (deferred to Sprint 1 module 4). Candidates, ranked: (1) `@napi-rs/keyring` — prebuilt for x64 Windows, no node-gyp, no admin, talks to Windows Credential Manager via wincred; (2) DPAPI via PowerShell subprocess (`ProtectedData.Protect` / `Unprotect`) — zero deps but per-call latency; (3) file-based AES-GCM with key derived from a per-user secret stored in DPAPI. `keytar` is excluded: archived 2023, no Node 24 prebuilds, would force the node-gyp/MSVC fallback that violates §1a.
 - `skills/loader.ts` — fs walker over `%LocalAppData%\OfficeAIAssistant\skills\`, parses frontmatter, exposes `list()` + `load(name)`
 - `outlook/tier-router.ts` — runtime tier 1/2/3 resolver
 - `outlook/com-sidecar.ts` — spawn the bundled `outlook-com.exe`, manage lifecycle, MCP-stdio bridge

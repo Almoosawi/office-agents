@@ -1,8 +1,15 @@
 // SQLite memory layer for the assistant-bridge — zero native deps.
 //
-// Uses Node's built-in `node:sqlite` (stable from Node 22.5+, FTS5 enabled).
-// This avoids better-sqlite3's node-gyp / MSVC Build Tools requirement,
-// which would violate the "no admin privileges, ever" rule (ARCHITECTURE §1a).
+// Uses Node's built-in `node:sqlite` — Stability 1.1 (active development) on
+// Node 24, FTS5 enabled. This is an *accepted* experimental dependency: the
+// alternative (better-sqlite3) needs node-gyp + MSVC Build Tools, which would
+// require an admin install and violate the "no admin privileges, ever" rule
+// (ARCHITECTURE §1a). Node 24+ is pinned at install time; if a future minor
+// version tweaks the API, we update this layer alongside the runtime bump.
+// `--experimental-sqlite` is no longer required on Node 24 (the module is
+// available unflagged), but an `ExperimentalWarning` may still be emitted —
+// silence it via `--no-warnings=ExperimentalWarning` in the bridge launcher
+// rather than suppressing all warnings globally.
 //
 // - WAL mode + FTS5
 // - Path: %LocalAppData%\OfficeAIAssistant\data\memory.db

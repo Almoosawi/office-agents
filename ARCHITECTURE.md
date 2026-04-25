@@ -63,7 +63,7 @@
 |                                                            |
 |  Memory:    SQLite at %APPDATA%\OfficeAIAssistant\         |
 |             memory.db  (cross-host, persistent)            |
-|  Secrets:   OS keychain via keytar                         |
+|  Secrets:   OS keychain (backend TBD)                      |
 |  Skills:    %APPDATA%\OfficeAIAssistant\skills\<name>\     |
 +-----------------+----------------+------------------------+
                   |                |
@@ -232,7 +232,7 @@ Tables:
 | `session_summaries` | generated summaries with citation IDs back to observation/message rows; the only thing auto-injected into future prompts (raw bodies require explicit retrieval) |
 | `facts` | persistent cross-session user facts; scope (`global`/per-host); fact_put/fact_delete tools; never auto-extracted from `<untrusted_data>` content without a confirmation gate |
 | `settings` | per-host instructions, provider preference, persona overrides, retention policy (default 90 days for observations, infinite for facts unless user changes) |
-| `secrets_meta` | non-sensitive metadata only; actual tokens live in Windows Credential Manager via keytar |
+| `secrets_meta` | non-sensitive metadata only; actual tokens live in the OS keychain. Backend is decision-pending (Sprint 1 module 4) — candidates: `@napi-rs/keyring` (best fit, prebuilt, no admin), DPAPI subprocess, or file-based encrypted store. Whichever ships, `keytar` is **not** the answer (archived, no Node 24 prebuilds). |
 | `outlook_handles` | port of your `outlook_mcp` handle registry — short IDs for emails/events/tasks |
 | `skill_state` | last-loaded skills per host, usage counters |
 | `memory_fts` | FTS5 virtual table indexing `observations.payload`, `messages.content`, `session_summaries.text`, `facts.value` — single search surface |
@@ -276,7 +276,7 @@ Cross-host memory works because all four taskpanes hit the same bridge -> same S
 | Source | Used for |
 |---|---|
 | `office-agents-word-v0.0.4` | **fork base** — Svelte 5 chat UI, AppAdapter pattern, Word/Excel/PPT tool packages, bridge dev infra, OAuth providers |
-| `office-agents-word-v0.0.4/packages/bridge` | productionised into `assistant-bridge` (add CLI adapters, SQLite, keytar, tier router) |
+| `office-agents-word-v0.0.4/packages/bridge` | productionised into `assistant-bridge` (add CLI adapters, SQLite, OS-keychain wrapper, tier router) |
 | `Email MCP / outlook_mcp` design spec | **direct port** to TS for Tiers 1-2 (15-tool surface, handle registry, compact format, send-confirm pattern) |
 | `Email MCP / outlook_mcp` Python code | **bundled as-is** for Tier 3 sidecar (PyInstaller, ships in installer) |
 | `Mait Agent` Go daemon | reference only — not used (too heavy for an add-in) |
