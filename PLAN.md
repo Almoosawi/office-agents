@@ -4,6 +4,7 @@ Pair with `ARCHITECTURE.md`. This file is the build sequence.
 
 > **Revision log**
 > - r2 (2026-04-25): integrated GPT/codex Checkpoint-2 review. 7 fixes applied: CLI text-only boundary; MSAL NAA (not legacy SSO) for Graph; Graph-primary on M365 (not EWS-first); per-user startup app instead of Windows service (Outlook COM requires user session); HTTPS port-range probe instead of `%APPDATA%` handshake; dual-side gate enforcement; untrusted-content envelope for prompt-injection defence.
+> - r3 (2026-04-25): added hard constraint **"no admin privileges, ever"**. Replaced MSI installer with per-user portable install. Cert handling moved to `Cert:\CurrentUser\*` only. All registry writes restricted to `HKCU`. Junction-only (no symlinks). See `ARCHITECTURE.md §1a`.
 
 ---
 
@@ -164,14 +165,19 @@ Manifest: extend root `manifest.json` to add Outlook scope + commands (compose p
    - destructive-op gate (highlight what will change/delete)
 2. Bridge-side gate enforcement (`packages/bridge/src/gates.ts`) — server refuses tool calls flagged as destructive unless paired with a `gate_token` issued by user click.
 3. Tests: vitest in each package; e2e via office-bridge harness against a real Word/Excel/PPT/Outlook session.
-4. Wix MSI installer (`installer/`):
-   - bundles taskpane static files, bridge binary, outlook-com sidecar, default skills
-   - registers manifest for sideload
-   - **bridge runs as a per-user startup app, NOT a Windows service.** Registers via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (or Task Scheduler logon trigger). Reason: Tier-3 Outlook COM automation requires the interactive logged-in user session and profile — Outlook Object Model is not supported from a service/unattended context.
-   - bridge spawns the outlook-com sidecar as a child process in the same user context, so COM operations have a valid user session
+4. **Per-user portable installer** (`installer/`) — **no admin, no MSI, no UAC** (per ARCHITECTURE §1a):
+   - Ship a signed `.zip` (and optionally a self-extracting exe) that unpacks to `%LocalAppData%\OfficeAIAssistant\`. No `Program Files`, no MSI.
+   - PowerShell `install.ps1` runs entirely in user context:
+     - Copy taskpane static files, bridge binary, outlook-com sidecar, default skills into `%LocalAppData%\OfficeAIAssistant\`.
+     - Generate self-signed dev cert into `Cert:\CurrentUser\My` and trust via `Cert:\CurrentUser\Root` (PowerShell `New-SelfSignedCertificate` + `Import-Certificate -CertStoreLocation Cert:\CurrentUser\Root`). **Never** `Cert:\LocalMachine\*`.
+     - Register bridge auto-start via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\OfficeAIAssistant` (or a Task Scheduler logon trigger registered to the current user only). **Never** `HKLM`, never a Windows service.
+     - Sideload the unified manifest via Office's HKCU developer add-in path (`office-addin-debugging start manifest.json` or direct write to `HKCU\Software\Microsoft\Office\<App>\Addins\Developer\OfficeAIAssistant`).
+   - PowerShell `uninstall.ps1` reverses every step (Run key, certs, sideload, files). User context only.
+   - Bridge: per-user startup app, NOT a Windows service. Outlook COM (Tier 3) requires the interactive logged-in user session — service-host COM is not supported. The bridge spawns the outlook-com sidecar as a child process in the same user context.
+   - Forbidden anywhere in the install/uninstall path: writes to `Program Files`, `HKLM`, `Cert:\LocalMachine\*`, system PATH, scheduled tasks not scoped to the current user, `mklink /D` (symlink, requires admin), or any Windows service registration.
 5. Telemetry off by default; opt-in only.
 
-**Deliverable:** an MSI you double-click. After install, opening any of the four Office hosts shows a Mait button on the ribbon -> sidebar -> works.
+**Deliverable:** a `.zip` + `install.ps1` you double-click — no UAC. After install, opening any of the four Office hosts shows a Mait button on the ribbon -> sidebar -> works.
 
 ---
 
@@ -435,6 +441,7 @@ Mapping per CLI (verified flags from this PC's installed versions):
 | MSAL NAA requires Azure app registration | Sprint-2 first task: register app, declare client ID in manifest `webApplicationInfo`/`authorization`, document setup in `docs/AZURE_SETUP.md` |
 | CLI native tool execution would bypass our boundary | All CLI adapters run text-only; tool calls extracted from model output via `<office_tool>` markers; CLI's own filesystem/shell tools are never engaged in v1 |
 | Bridge as Windows service blocks Outlook COM | Bridge runs as per-user startup app (HKCU Run key); COM sidecar inherits the user session |
+| Anything that triggers UAC breaks the "no admin" constraint | Hard rule in `ARCHITECTURE.md §1a`: `%LocalAppData%`, HKCU, `Cert:\CurrentUser` only. Per-user portable installer. CI smoke includes a "no UAC" pass running install.ps1 as a standard user. |
 | Prompt injection from email/document content | All host-derived text wrapped in `<untrusted_data>` markers; system prompt forbids treating as instructions; tool calls still hit confirmation gates regardless of source |
 | New Outlook (web) on Windows lacks COM | Tier 3 only fires on classic Outlook; auto-disabled on new Outlook (`mailbox.diagnostics.hostName === 'OutlookWebApp'` -> Tier 2 only) |
 | Gemini CLI tool-calling immaturity | v1 ships text-only Gemini; mark as "limited" in provider selector |

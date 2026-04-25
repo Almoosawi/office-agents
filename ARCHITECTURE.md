@@ -12,6 +12,18 @@
 - Reuse existing PC CLI auth (`claude`, `codex`, `gemini`) so the user has no API keys to manage.
 - Match the Anthropic "Claude for Excel/Slides" UX baseline; extend it to Word + Outlook with richer tools, skills, and cross-host memory.
 
+## 1a. Hard constraints (non-negotiable)
+
+- **No admin privileges, ever.** Every step of install, first-run, daily use, and uninstall executes as the standard logged-in user. No UAC prompts. Implications enforced throughout this doc and `PLAN.md`:
+  - Install path: `%LocalAppData%\OfficeAIAssistant\` (never `Program Files`).
+  - Registry writes: `HKCU` only (never `HKLM`).
+  - No Windows services. Bridge auto-start via HKCU `Run` key or Task Scheduler `Logon` trigger in the current user's task store.
+  - Self-signed cert: `Cert:\CurrentUser\My` + `Cert:\CurrentUser\Root` only. Never `Cert:\LocalMachine\*`.
+  - Junctions only (`mklink /J`), never symlinks (`mklink /D` requires admin or Developer Mode).
+  - Office add-in sideload: HKCU developer-add-in registry path only (the default for `office-addin-debugging`).
+  - Firewall: bind to `127.0.0.1` only — no inbound firewall rules required.
+  - Outlook COM (Tier 3 sidecar): runs in the same user session that opened Outlook. No service-host elevation.
+
 ## 2. Component map
 
 ```
