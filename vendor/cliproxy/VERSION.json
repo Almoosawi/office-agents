@@ -1,0 +1,11 @@
+{
+  "$comment": "Pinned CLIProxyAPI release. Bumped via scripts/fetch-cliproxy.cjs --pin <tag>. The binary itself lives outside git (.gitignore) — fetch with `pnpm fetch:cliproxy`. Per-user installer ships the resolved binary into %LocalAppData%\\OfficeAIAssistant\\bin\\.",
+  "tag": "v6.9.38",
+  "asset": "CLIProxyAPI_6.9.38_windows_amd64.zip",
+  "binary": "cli-proxy-api.exe",
+  "sha256": "20c1b9ccf67d6046d557ab84dd7cf86f2e96642cadb3b2f96ad75d1c35d7df84",
+  "url": "https://github.com/router-for-me/CLIProxyAPI/releases/download/v6.9.38/CLIProxyAPI_6.9.38_windows_amd64.zip",
+  "publishedAt": "2026-04-25T13:46:24Z",
+  "license": "MIT",
+  "upstream": "https://github.com/router-for-me/CLIProxyAPI"
+}

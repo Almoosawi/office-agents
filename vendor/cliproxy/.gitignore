@@ -1,0 +1,8 @@
+# Binary artifacts: pulled by `pnpm fetch:cliproxy`, never committed.
+*.exe
+*.zip
+*.tar.gz
+*.dll
+config.yaml
+auths/
+logs/

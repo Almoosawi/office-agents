@@ -41,6 +41,7 @@ export {
 export {
 	createSidecarAdapter,
 	sidecarAdapter,
+	type SidecarAdapterOptions,
 } from "./sidecar.js";
 
 export {

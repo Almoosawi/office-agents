@@ -28,17 +28,29 @@ import type {
 	ProviderEntry,
 } from "./types.js";
 
-export function createSidecarAdapter(opts: OpenAiCompatOptions = {}): ProviderAdapter {
+export interface SidecarAdapterOptions extends OpenAiCompatOptions {
+	/**
+	 * API key supplier for the sidecar HTTP server. Called fresh on each
+	 * request so that the manager rotating keys (e.g. on restart) is picked
+	 * up without re-creating the adapter. Returns `undefined` when the
+	 * sidecar isn't running yet — callers will get a 401 from the proxy,
+	 * which probe() turns into `available: false`.
+	 */
+	apiKey?: () => string | undefined;
+}
+
+export function createSidecarAdapter(opts: SidecarAdapterOptions = {}): ProviderAdapter {
+	const getKey = (): string | undefined => opts.apiKey?.();
 	return {
 		kind: "sidecar",
 		probe(entry: ProviderEntry): Promise<ProbeResult> {
-			return probeOpenAiCompat(entry, undefined, opts);
+			return probeOpenAiCompat(entry, getKey(), opts);
 		},
 		listModels(entry: ProviderEntry): Promise<string[]> {
-			return listModelsOpenAiCompat(entry, undefined, opts);
+			return listModelsOpenAiCompat(entry, getKey(), opts);
 		},
 		chat(entry: ProviderEntry, req: ChatRequest): AsyncIterable<ChatChunk> {
-			return chatOpenAiCompat(entry, req, undefined, opts);
+			return chatOpenAiCompat(entry, req, getKey(), opts);
 		},
 	};
 }

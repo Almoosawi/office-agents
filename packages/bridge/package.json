@@ -14,7 +14,8 @@
     "./client": "./src/client.ts",
     "./protocol": "./src/protocol.ts",
     "./providers": "./src/providers/index.ts",
-    "./server": "./src/server.ts"
+    "./server": "./src/server.ts",
+    "./sidecar": "./src/sidecar/index.ts"
   },
   "publishConfig": {
     "main": "dist/index.js",
@@ -38,6 +39,10 @@
       "./providers": {
         "types": "./dist/providers/index.d.ts",
         "import": "./dist/providers/index.js"
+      },
+      "./sidecar": {
+        "types": "./dist/sidecar/index.d.ts",
+        "import": "./dist/sidecar/index.js"
       },
       "./server": {
         "types": "./dist/server.d.ts",

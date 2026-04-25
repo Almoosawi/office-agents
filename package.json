@@ -29,7 +29,10 @@
     "release:ppt": "node scripts/release.mjs ppt",
     "release:word": "node scripts/release.mjs word",
     "release:sdk": "node scripts/release.mjs sdk",
-    "release:bridge": "node scripts/release.mjs bridge"
+    "release:bridge": "node scripts/release.mjs bridge",
+    "fetch:cliproxy": "node scripts/fetch-cliproxy.cjs",
+    "fetch:cliproxy:verify": "node scripts/fetch-cliproxy.cjs --verify",
+    "cliproxy:update": "node scripts/fetch-cliproxy.cjs --latest"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.13",

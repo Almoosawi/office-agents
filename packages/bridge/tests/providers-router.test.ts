@@ -76,7 +76,7 @@ describe("ProviderRouter.resolve", () => {
 					claude: { available: false, reason: "ENOENT" },
 				}),
 				sidecar: fakeAdapter("sidecar", {
-					"http://127.0.0.1:7860/api/provider/claude/v1": {
+					"http://127.0.0.1:8317/api/provider/claude/v1": {
 						available: true,
 						models: ["claude-opus-4-7"],
 					},
@@ -104,7 +104,7 @@ describe("ProviderRouter.resolve", () => {
 					claude: { available: false, reason: "missing" },
 				}),
 				sidecar: fakeAdapter("sidecar", {
-					"http://127.0.0.1:7860/api/provider/claude/v1": {
+					"http://127.0.0.1:8317/api/provider/claude/v1": {
 						available: false,
 						reason: "ECONNREFUSED",
 					},
@@ -127,7 +127,7 @@ describe("ProviderRouter.resolve", () => {
 					claude: { available: false, reason: "ENOENT" },
 				}),
 				sidecar: fakeAdapter("sidecar", {
-					"http://127.0.0.1:7860/api/provider/claude/v1": {
+					"http://127.0.0.1:8317/api/provider/claude/v1": {
 						available: true,
 					},
 				}),

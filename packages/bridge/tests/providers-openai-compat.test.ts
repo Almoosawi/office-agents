@@ -11,7 +11,7 @@ const sidecarEntry: ProviderEntry = {
 	kind: "sidecar",
 	label: "Sidecar Claude",
 	enabled: true,
-	base_url: "http://127.0.0.1:7860/api/provider/claude/v1",
+	base_url: "http://127.0.0.1:8317/api/provider/claude/v1",
 };
 
 describe("toChatChunks (SSE parser)", () => {
