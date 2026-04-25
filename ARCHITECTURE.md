@@ -46,11 +46,15 @@
 |  assistant-bridge  (Node, single process, ~1k LoC target) |
 |                                                            |
 |  Provider router                                           |
-|    - CLI adapter:  spawn `claude` (--output-format=...)    |
-|    - CLI adapter:  spawn `codex` exec ...                  |
-|    - CLI adapter:  spawn `gemini` ...                      |
+|    - CLI adapter:  spawn `claude` (text-only)              |
+|    - CLI adapter:  spawn `codex` exec (text-only)          |
+|    - CLI adapter:  spawn `gemini` (text-only)              |
 |    - OAuth:        Anthropic Pro, OpenAI Codex (carryover) |
-|    - BYOK:         OpenAI-compatible                       |
+|    - BYOK API:     OpenAI/Anthropic/Google/etc.            |
+|    - Local LLM:    Ollama, LMStudio, vLLM, llama.cpp,      |
+|                    or any OpenAI-compatible localhost API  |
+|    Per-provider config: model, base_url, temperature,      |
+|    system_prompt_override (appended after persona+skills)  |
 |                                                            |
 |  MCP-style tool surface  (NOT separate processes)          |
 |    - host tool calls forwarded to taskpane via WSS         |

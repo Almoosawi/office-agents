@@ -6,6 +6,22 @@ Pair with `ARCHITECTURE.md`. This file is the build sequence.
 > - r2 (2026-04-25): integrated GPT/codex Checkpoint-2 review. 7 fixes applied: CLI text-only boundary; MSAL NAA (not legacy SSO) for Graph; Graph-primary on M365 (not EWS-first); per-user startup app instead of Windows service (Outlook COM requires user session); HTTPS port-range probe instead of `%APPDATA%` handshake; dual-side gate enforcement; untrusted-content envelope for prompt-injection defence.
 > - r3 (2026-04-25): added hard constraint **"no admin privileges, ever"**. Replaced MSI installer with per-user portable install. Cert handling moved to `Cert:\CurrentUser\*` only. All registry writes restricted to `HKCU`. Junction-only (no symlinks). See `ARCHITECTURE.md §1a`.
 > - r4 (2026-04-25): GPT review fixes — (a) build scripts no longer use `rm -rf` (junction-safe `scripts/clean-build-outputs.cjs`); (b) ARCHITECTURE.md `§12` no longer references Wix MSI / Windows service; (c) PLAN.md self-review #1 no longer says "EWS first" (now Graph-primary on M365, EWS only on on-prem); (d) CLI adapter table is strict text-only with `<office_tool>` markers (no `tool_use` -> `tool_call` mapping in v1); (e) `protocol.ts` default host pinned to `127.0.0.1` (was `localhost`); (f) memory layer extended with claude-mem-inspired observations / session_summaries / FTS5 search and privacy controls (method only — no AGPL code copied).
+> - r5 (2026-04-25): added **local-LLM provider lane** (Ollama, LMStudio, vLLM, llama.cpp, generic OpenAI-compatible) with auto-discovery of available models. Added **per-provider config**: model, base_url, temperature, top_p, max_tokens, system_prompt_override. Added **install checkpoints** per sprint so the user knows exactly when sideload becomes useful at each stage.
+
+---
+
+## Install checkpoints (when can the user actually run it?)
+
+| After | What works on sideload | What does NOT yet | How to install |
+|---|---|---|---|
+| **Sprint 0** ✅ | Word/Excel/PPT add-ins from upstream fork. Branding still says "Office Agents". Chat works only with whatever providers the upstream fork already supports (BYOK + Anthropic OAuth + OpenAI Codex OAuth). No Mait persona, no skills auto-load, no Outlook, no CLI providers, no local LLMs. | Outlook, CLI providers, Ollama/local LLMs, Mait branding, our memory layer, selection-aware host_context blob, confirmation gates | `pnpm bridge:serve` + `pnpm start:word` (or `:excel` / `:ppt`) |
+| **Sprint 1** | Above + **Mait chat backed by `claude` / `codex` / `gemini` CLI** (text-only, no admin), **Ollama / LMStudio / vLLM** local LLM lane with model+temp+system-prompt picker, **persistent SQLite memory** at `%LocalAppData%\OfficeAIAssistant\data\memory.db` with FTS5 search, **skills loader** auto-discovering `%LocalAppData%\OfficeAIAssistant\skills\<name>\SKILL.md`. | Outlook host, Mait branding on the manifest, selection-aware blob composer, confirmation gates, MSAL NAA | Same install commands. After Sprint 1, you'll see the new provider list in the Settings panel. |
+| **Sprint 2** | Above + **Outlook host** (Tier 1 + Tier 2). 4 hosts working. | Tier-3 COM sidecar, branding, gates | `pnpm start:outlook` added |
+| **Sprint 3** | Above + Tier-3 COM sidecar (full Outlook coverage even if Graph/EWS fail). | Branding, gates | Same |
+| **Sprint 4** | Above + **Mait persona auto-loaded**, default skill set seeded, selection-aware host_context blob, per-host Instructions field, "Continue from <host>" cross-host history. UI looks like Mait. | Confirmation gates, polished installer | Same |
+| **Sprint 5** | **Per-user portable installer** (no admin, no UAC, no MSI). Confirmation gates enforced both in bridge and taskpane. | (ship) | `install.ps1` from the released `.zip` |
+
+I will explicitly call out "**INSTALLABLE NOW** — try `<command>`" each time a sprint commits.
 
 ---
 
@@ -52,15 +68,38 @@ Add to `packages/bridge/src/`:
 The bridge parses these markers, dispatches them via WSS `tool.invoke` to the taskpane (where Office.js executes), pushes the result back as `tool.result`, and continues the conversation. This guarantees Office tools are the ONLY tools — claude/codex/gemini cannot reach the filesystem, shell, or web on their own. v2 may upgrade individual CLIs to native tool calling with a constrained MCP server, but only after this boundary is rock-solid.
 - `providers/oauth-anthropic.ts` — already in fork; verify
 - `providers/oauth-codex.ts` — already in fork; verify
-- `providers/byok.ts` — generic OpenAI-compatible
+- `providers/byok.ts` — generic OpenAI-compatible (also covers local LLMs — see below)
+- `providers/local-llm.ts` — convenience presets for **Ollama** (`http://127.0.0.1:11434/v1`), **LMStudio** (`http://127.0.0.1:1234/v1`), **vLLM** (`http://127.0.0.1:8000/v1`), **llama.cpp server** (`http://127.0.0.1:8080/v1`), and **custom OpenAI-compatible**. Each preset uses the OpenAI-compatible chat completions surface; the model dropdown is auto-populated by hitting `GET <base_url>/models` on the chosen base_url.
 - `providers/router.ts` — single `selectProvider()` based on settings + health
+
+**Per-provider config schema** (stored in `settings` table, scope `provider:<id>`):
+
+```ts
+interface ProviderConfig {
+  id: string;                          // 'cli:claude' | 'cli:codex' | 'cli:gemini' | 'byok:openai' | 'local:ollama' | 'local:lmstudio' | 'local:vllm' | 'local:llamacpp' | 'local:custom'
+  kind: 'cli' | 'oauth' | 'byok' | 'local';
+  model?: string;                      // e.g. 'llama3.2:latest', 'qwen2.5-coder:32b' (Ollama uses ':tag' format)
+  base_url?: string;                   // for local/byok kinds
+  temperature?: number;                // 0.0..2.0, default 0.7 (UI clamps; per-model tighter ranges via tooltip)
+  top_p?: number;                      // optional, 0..1, default 1.0
+  max_tokens?: number;                 // optional, hard cap per response
+  system_prompt_override?: string;     // appended AFTER persona + skill prompts, before the user message; leave empty to inherit only persona
+  api_key_ref?: string;                // keytar key for byok providers; never plaintext in DB
+  enabled: boolean;
+}
+```
+
+**Settings UI surface** (extended in Sprint 1, `packages/core/src/chat/settings-panel.svelte`):
+- Provider list with enable toggle + "Set as default"
+- Per-provider drawer: model picker (auto-populated from `/v1/models` for local/byok; fixed for CLI), temperature slider 0.0–2.0 (step 0.1), top_p (advanced), max_tokens (advanced), system_prompt_override textarea ("Appended to persona — leave empty to use only persona + skills")
+- For local LLMs: "Test connection" button hits `GET <base_url>/models` and lists discovered models with sizes
 - `memory/db.ts` — SQLite via `better-sqlite3`; WAL mode; FTS5 module; migrations in `memory/migrations/`
 - `memory/sessions.ts`, `memory/messages.ts`, `memory/facts.ts`, `memory/settings.ts`, `memory/handles.ts`, `memory/skill_state.ts`, `memory/observations.ts`, `memory/summaries.ts`
 - `memory/search.ts` — FTS5 query layer (single surface across observations + messages + summaries + facts), auto-skips `is_private=1`
 - `memory/privacy.ts` — `<private>...</private>` parser, redaction pipeline, retention sweep (sends expired rows to OS Recycle Bin, never permanent delete per global rule #0)
 - `memory/summarizer.ts` — periodic background pass that turns long sessions into `session_summaries` with citation IDs; runs only when conversation idle > 60s
 - `secrets/keychain.ts` — `keytar` wrapper, namespace `office-ai-assistant`
-- `skills/loader.ts` — fs walker over `%APPDATA%\OfficeAIAssistant\skills\`, parses frontmatter, exposes `list()` + `load(name)`
+- `skills/loader.ts` — fs walker over `%LocalAppData%\OfficeAIAssistant\skills\`, parses frontmatter, exposes `list()` + `load(name)`
 - `outlook/tier-router.ts` — runtime tier 1/2/3 resolver
 - `outlook/com-sidecar.ts` — spawn the bundled `outlook-com.exe`, manage lifecycle, MCP-stdio bridge
 
