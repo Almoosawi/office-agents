@@ -54,7 +54,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist tsconfig.build.tsbuildinfo && tsc -p tsconfig.build.json",
+    "build": "node ../../scripts/clean-build-outputs.cjs --dirs dist --files tsconfig.build.tsbuildinfo && tsc -p tsconfig.build.json",
     "cli": "pnpm build && node dist/cli.js",
     "start": "pnpm build && node dist/cli.js serve",
     "prepublishOnly": "pnpm build",

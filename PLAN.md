@@ -5,6 +5,7 @@ Pair with `ARCHITECTURE.md`. This file is the build sequence.
 > **Revision log**
 > - r2 (2026-04-25): integrated GPT/codex Checkpoint-2 review. 7 fixes applied: CLI text-only boundary; MSAL NAA (not legacy SSO) for Graph; Graph-primary on M365 (not EWS-first); per-user startup app instead of Windows service (Outlook COM requires user session); HTTPS port-range probe instead of `%APPDATA%` handshake; dual-side gate enforcement; untrusted-content envelope for prompt-injection defence.
 > - r3 (2026-04-25): added hard constraint **"no admin privileges, ever"**. Replaced MSI installer with per-user portable install. Cert handling moved to `Cert:\CurrentUser\*` only. All registry writes restricted to `HKCU`. Junction-only (no symlinks). See `ARCHITECTURE.md §1a`.
+> - r4 (2026-04-25): GPT review fixes — (a) build scripts no longer use `rm -rf` (junction-safe `scripts/clean-build-outputs.cjs`); (b) ARCHITECTURE.md `§12` no longer references Wix MSI / Windows service; (c) PLAN.md self-review #1 no longer says "EWS first" (now Graph-primary on M365, EWS only on on-prem); (d) CLI adapter table is strict text-only with `<office_tool>` markers (no `tool_use` -> `tool_call` mapping in v1); (e) `protocol.ts` default host pinned to `127.0.0.1` (was `localhost`); (f) memory layer extended with claude-mem-inspired observations / session_summaries / FTS5 search and privacy controls (method only — no AGPL code copied).
 
 ---
 
@@ -53,8 +54,11 @@ The bridge parses these markers, dispatches them via WSS `tool.invoke` to the ta
 - `providers/oauth-codex.ts` — already in fork; verify
 - `providers/byok.ts` — generic OpenAI-compatible
 - `providers/router.ts` — single `selectProvider()` based on settings + health
-- `memory/db.ts` — SQLite via `better-sqlite3`; migrations in `memory/migrations/`
-- `memory/sessions.ts`, `memory/messages.ts`, `memory/facts.ts`, `memory/settings.ts`, `memory/handles.ts`, `memory/skill_state.ts`
+- `memory/db.ts` — SQLite via `better-sqlite3`; WAL mode; FTS5 module; migrations in `memory/migrations/`
+- `memory/sessions.ts`, `memory/messages.ts`, `memory/facts.ts`, `memory/settings.ts`, `memory/handles.ts`, `memory/skill_state.ts`, `memory/observations.ts`, `memory/summaries.ts`
+- `memory/search.ts` — FTS5 query layer (single surface across observations + messages + summaries + facts), auto-skips `is_private=1`
+- `memory/privacy.ts` — `<private>...</private>` parser, redaction pipeline, retention sweep (sends expired rows to OS Recycle Bin, never permanent delete per global rule #0)
+- `memory/summarizer.ts` — periodic background pass that turns long sessions into `session_summaries` with citation IDs; runs only when conversation idle > 60s
 - `secrets/keychain.ts` — `keytar` wrapper, namespace `office-ai-assistant`
 - `skills/loader.ts` — fs walker over `%APPDATA%\OfficeAIAssistant\skills\`, parses frontmatter, exposes `list()` + `load(name)`
 - `outlook/tier-router.ts` — runtime tier 1/2/3 resolver
@@ -69,6 +73,10 @@ WebSocket protocol additions (extend existing `protocol.ts`):
 | bridge -> client | `tool.invoke` | { sessionId, tool_name, args } -- for built-in host tools |
 | client -> bridge | `tool.result` | { sessionId, tool_call_id, result } |
 | client -> bridge | `memory.facts.list / put / delete` | ... |
+| client -> bridge | `memory.search` | `{ query, host?, since?, until?, limit? }` -> compact rows with citation IDs |
+| client -> bridge | `memory.timeline` | `{ session_id?, host?, since?, until?, limit? }` -> chronological slice |
+| client -> bridge | `memory.get` | `{ citation_id }` -> full record |
+| client -> bridge | `memory.set_private` | `{ session_id?, message_id?, host_context_id? }` -> mark current scope private |
 | client -> bridge | `skills.list / load / install` | ... |
 | client -> bridge | `outlook.tier_probe` | -> { tier1: ok, tier2: { backend: "graph"|"ews"|"none" }, tier3: { available, started } } |
 
@@ -404,7 +412,65 @@ CREATE TABLE skill_state (
   last_loaded_at INTEGER,
   load_count INTEGER NOT NULL DEFAULT 0
 );
+
+-- Lifecycle event capture (claude-mem-inspired, license-clean — method only)
+CREATE TABLE observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  ts INTEGER NOT NULL,
+  kind TEXT NOT NULL,                 -- chat.send | tool.invoke | tool.result
+                                      -- selection.changed | gate.confirmed | gate.refused
+  source_host TEXT NOT NULL,          -- word | excel | powerpoint | outlook
+  payload TEXT NOT NULL,              -- compact JSON
+  is_private INTEGER NOT NULL DEFAULT 0,
+  redacted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_observations_session_ts ON observations(session_id, ts);
+CREATE INDEX idx_observations_kind_ts ON observations(kind, ts);
+
+CREATE TABLE session_summaries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  generated_at INTEGER NOT NULL,
+  text TEXT NOT NULL,
+  citation_ids TEXT NOT NULL,         -- JSON array of observation/message ids
+  redacted INTEGER NOT NULL DEFAULT 0
+);
+
+-- FTS5 virtual table — single search surface across all narrative text
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+  body,
+  source UNINDEXED,                   -- 'obs' | 'msg' | 'sum' | 'fact'
+  source_id UNINDEXED,
+  session_id UNINDEXED,
+  ts UNINDEXED,
+  is_private UNINDEXED,
+  tokenize = 'porter unicode61'
+);
+
+-- Triggers populate memory_fts; rows with is_private=1 are SKIPPED.
+CREATE TRIGGER messages_ai_fts AFTER INSERT ON messages BEGIN
+  INSERT INTO memory_fts(body, source, source_id, session_id, ts, is_private)
+  SELECT NEW.content, 'msg', NEW.id, NEW.session_id, NEW.ts, 0
+  WHERE NEW.content IS NOT NULL
+    AND COALESCE((SELECT value FROM settings WHERE scope='session:'||NEW.session_id AND key='is_private'),'0')='0';
+END;
+CREATE TRIGGER observations_ai_fts AFTER INSERT ON observations BEGIN
+  INSERT INTO memory_fts(body, source, source_id, session_id, ts, is_private)
+  SELECT NEW.payload, 'obs', NEW.id, NEW.session_id, NEW.ts, NEW.is_private
+  WHERE NEW.is_private = 0;
+END;
+CREATE TRIGGER summaries_ai_fts AFTER INSERT ON session_summaries BEGIN
+  INSERT INTO memory_fts(body, source, source_id, session_id, ts, is_private)
+  VALUES(NEW.text, 'sum', NEW.id, NEW.session_id, NEW.generated_at, 0);
+END;
+CREATE TRIGGER facts_ai_fts AFTER INSERT ON facts BEGIN
+  INSERT INTO memory_fts(body, source, source_id, session_id, ts, is_private)
+  VALUES(NEW.value, 'fact', NEW.id, NULL, NEW.created_at, 0);
+END;
 ```
+
+Set `PRAGMA journal_mode=WAL;` and `PRAGMA synchronous=NORMAL;` on connection open. DB lives at `%LocalAppData%\OfficeAIAssistant\data\memory.db` (per ARCHITECTURE §1a — local, not roaming).
 
 ---
 
@@ -424,11 +490,15 @@ Mapping per CLI (verified flags from this PC's installed versions):
 
 | CLI | Spawn args | stdout format | Maps to |
 |---|---|---|---|
-| `claude 2.1.119` | `claude --print --output-format=stream-json --input-format=stream-json` | newline-delimited JSON events | `content_block_delta` -> ProviderDelta.text; `tool_use` -> ProviderDelta.tool_call |
-| `codex 0.117.0` | `codex exec --json --skip-git-repo-check` | JSON events | similar mapping; codex tool calls map directly |
-| `gemini 0.36.0` | `gemini --output=json` (TBD: confirm flag set in v0.36) | JSON | text-only initially; tool calling added when CLI exposes it |
+**v1 = strict text-only across ALL three CLIs.** No CLI native tool-use is mapped to `ProviderDelta.tool_call`. The model emits Office tool intents as `<office_tool name="...">{...}</office_tool>` markers in its plain-text output; the bridge parses those markers itself. The CLIs' built-in filesystem/shell/web tools are never engaged in v1.
 
-(We will lock the exact spawn args in Sprint 1 by running `--help` on each CLI and reading current docs; assumptions above are the starting point.)
+| CLI | Spawn args (text-only mode) | stdout format | What we extract |
+|---|---|---|---|
+| `claude 2.1.119` | `claude --print` (no agent loop, no `--output-format=stream-json` with tool_use) | plain text stream | `ProviderDelta.text` only; `<office_tool>` markers parsed in-bridge |
+| `codex 0.117.0` | `codex exec` with the tools-disabled equivalent flags (locked in Sprint 1 from `codex exec --help`) | plain text stream | same |
+| `gemini 0.36.0` | `gemini` with tools disabled (locked in Sprint 1 from `gemini --help`) | plain text stream | same |
+
+Sprint 1 first task: run `--help` on each installed CLI binary and lock the exact text-only invocation. Mapping native CLI tool_use into provider deltas is deferred to v2 (and only after we add a constrained MCP server that the CLI can call into).
 
 ---
 
@@ -454,7 +524,7 @@ Mapping per CLI (verified flags from this PC's installed versions):
 
 To fold into the relevant sprints before any code lands:
 
-1. **Tier-2 routing should be probe-based, not date-based.** Instead of "if date >= 2026-10 use Graph", attempt EWS first; on `ErrorAccessDenied` / network error / 410, fall through to Graph-NAA. Survives whatever Microsoft's actual sunset cadence ends up being.
+1. **Tier-2 routing is backend-probe-based.** Detect the mailbox backend via `mailbox.diagnostics.hostName` + `ewsUrl` once per session and cache. **M365 mailboxes -> Graph via MSAL NAA (primary).** **On-prem Exchange -> EWS via `makeEwsRequestAsync`.** No date logic, no EWS-first fallback path on M365 (Microsoft has turned off legacy Exchange Online tokens — EWS is no longer the supported path on M365 add-ins). On unexpected errors at any tier, fall through to Tier 3 (COM sidecar).
 2. **NAA needs explicit manifest declaration.** Add `webApplicationInfo` block (Azure app registration, client ID, MS Graph scopes) to the unified manifest. Without this, `OfficeRuntime.auth.getAccessToken` returns nothing. Sprint-2 task: register the Azure app, store IDs in build-time env.
 3. **Bridge port collision.** 4017 is the office-agents-word default — if the user still has that running, we collide. Bridge binds 4017 first, falls back through 4018..4029. The taskpane (sandboxed WebView2, no filesystem access) discovers the port by HTTPS-probing `https://localhost:4017..4029/health` until one returns the expected signature `{"ok":true,"app":"office-ai-assistant","version":"..."}`. NO filesystem-based handshake.
 4. **Self-signed localhost cert.** Office.js taskpanes inside Office require a trusted cert when talking to localhost HTTPS. office-agents-word ships an auto-install dev cert; for production we either re-use that or generate one at install time (Wix custom action). Document in Sprint-5.

@@ -29,8 +29,8 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "clean": "rm -rf dist",
+    "build": "node ../../scripts/clean-build-outputs.cjs --dirs dist && tsc -p tsconfig.build.json",
+    "clean": "node ../../scripts/clean-build-outputs.cjs --dirs dist",
     "prepublishOnly": "pnpm build",
     "test": "vitest run"
   },

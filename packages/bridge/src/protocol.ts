@@ -1,5 +1,8 @@
 export const BRIDGE_PROTOCOL_VERSION = 1;
-export const DEFAULT_BRIDGE_HOST = "localhost";
+// Bind/connect host: "127.0.0.1" loopback IPv4 ONLY (per ARCHITECTURE §1a).
+// Avoids "localhost" name-resolution drift (IPv6 ::1 vs IPv4) and ensures the
+// cert's SAN matches without ambiguity.
+export const DEFAULT_BRIDGE_HOST = "127.0.0.1";
 export const DEFAULT_BRIDGE_PORT = 4017;
 export const DEFAULT_BRIDGE_WS_PATH = "/ws";
 export const DEFAULT_BRIDGE_HTTP_URL = `https://${DEFAULT_BRIDGE_HOST}:${DEFAULT_BRIDGE_PORT}`;

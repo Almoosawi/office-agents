@@ -213,20 +213,45 @@ recipients, or numbers. If you would need to guess, ask one question.
 
 ## 8. Memory model
 
-SQLite, single file at `%APPDATA%\OfficeAIAssistant\memory.db`:
+SQLite (single file, **WAL mode**, FTS5 enabled) at `%LocalAppData%\OfficeAIAssistant\data\memory.db` — **local-only, no roaming**. Roaming `%APPDATA%` is opt-in for users who explicitly enable cross-machine sync.
+
+Design takes ideas (not code) from `github.com/thedotmack/claude-mem` (AGPL-3.0 — we never copy implementation; method only). The good ideas borrowed: lifecycle event observation, FTS5 search, generated session summaries with citation IDs, three-layer retrieval (search -> timeline -> get_observations). Things deliberately not adopted from claude-mem: Bun worker, Chroma vector store, separate localhost service on a second port, auto-installed hooks. We keep memory inside the bridge process.
+
+Tables:
 
 | Table | Purpose |
 |---|---|
-| `sessions` | one row per chat session (host, started_at, summary, persona_version) |
-| `messages` | role, content, tool_calls, tool_results, host_context_ref |
-| `host_contexts` | snapshot blobs (selection state at turn time) — for replay |
-| `facts` | persistent user facts (long-term cross-session memory) |
-| `settings` | per-host instructions, provider preference, persona overrides |
-| `secrets_meta` | non-sensitive metadata; actual tokens live in OS keychain |
+| `sessions` | one row per chat session (host, started_at, summary_id, persona_version, provider) |
+| `messages` | role, content, tool_calls, tool_results, host_context_ref, `is_private` (0/1) |
+| `host_contexts` | compact snapshot blobs (selection state at turn time) — keyed by message |
+| `observations` | lifecycle event capture: `chat.send`, `tool.invoke`, `tool.result`, `selection.changed`, `gate.confirmed`, `gate.refused`. Fields: id, session_id, ts, kind, payload (compact JSON), source_host, is_private, redacted (0/1) |
+| `session_summaries` | generated summaries with citation IDs back to observation/message rows; the only thing auto-injected into future prompts (raw bodies require explicit retrieval) |
+| `facts` | persistent cross-session user facts; scope (`global`/per-host); fact_put/fact_delete tools; never auto-extracted from `<untrusted_data>` content without a confirmation gate |
+| `settings` | per-host instructions, provider preference, persona overrides, retention policy (default 90 days for observations, infinite for facts unless user changes) |
+| `secrets_meta` | non-sensitive metadata only; actual tokens live in Windows Credential Manager via keytar |
 | `outlook_handles` | port of your `outlook_mcp` handle registry — short IDs for emails/events/tasks |
 | `skill_state` | last-loaded skills per host, usage counters |
+| `memory_fts` | FTS5 virtual table indexing `observations.payload`, `messages.content`, `session_summaries.text`, `facts.value` — single search surface |
 
-Cross-host memory works because all four taskpanes hit the same bridge -> same SQLite file.
+**Privacy controls (day-one):**
+- Inline `<private>...</private>` markers in chat input -> stored with `is_private=1`, NEVER indexed in `memory_fts`, NEVER included in summaries.
+- "Do not remember this document/email" toggle on the chat header -> sets `is_private=1` on the current `host_context` and any messages that quote it; redacts before any summarization pass.
+- Retention setting (default: 90 days observations, infinite facts) -> background sweep deletes (sends to OS Recycle Bin via shell op, never permanent) expired observations.
+- Redaction: sender PII / file paths / phone numbers / emails / credit-card-shaped numbers stripped before content is included in any session summary.
+
+**Retrieval API (bridge-local tools the model can call):**
+
+| Tool | Purpose |
+|---|---|
+| `memory.search(query, host?, since?, until?, limit?)` | FTS5 search across observations + messages + summaries + facts. Returns compact rows with citation IDs. |
+| `memory.timeline(session_id?, host?, since?, until?, limit?)` | Chronological recent slice — observations + messages joined, newest first. |
+| `memory.get(citation_id)` | Fetch full record by citation ID (so the model can quote precisely). |
+| `memory.fact_put(scope, key, value)` | Persist a long-term fact (gated — prompts user confirmation). |
+| `memory.fact_delete(scope, key)` | Remove a fact. |
+
+**Auto-injection rule:** every chat turn includes the current host_context blob + any active session_summary + any facts whose scope matches. Raw observations/messages are NEVER auto-injected — the model must call `memory.search`/`memory.timeline`/`memory.get` to fetch them. This keeps token cost predictable.
+
+Cross-host memory works because all four taskpanes hit the same bridge -> same SQLite file. Same persona, same facts, same history visible from Word, Excel, PowerPoint, Outlook.
 
 ## 9. Security & confirmation gates
 
@@ -264,5 +289,5 @@ Risk: as of the docs we read, unified manifest support for Word/Excel/PPT is "pr
 ## 12. Build / sideload / install story
 
 - Dev: `pnpm dev` -> Vite HTTPS dev server on localhost:3000 + bridge on 4017 -> `office-addin-debugging start manifest.json` to sideload into the running Office host.
-- Distribution: Wix MSI installer that bundles the static taskpane (HTTPS-served from a localhost-scoped server in production), the bridge as a Windows service, and the outlook-com sidecar (PyInstaller exe). Manifest registered for sideload + AppSource submission.
-- W2/W3 rules apply: `node_modules` junctioned to `C:\node_modules\office-ai-assistant`, builds to `C:\builds\office-ai-assistant`.
+- Distribution: **per-user portable install** (no admin, no MSI, no UAC) — see `PLAN.md` Sprint 5. Ships as a signed `.zip` + `install.ps1` that drops everything into `%LocalAppData%\OfficeAIAssistant\`, registers HKCU `Run` for bridge auto-start, writes the dev cert to `Cert:\CurrentUser\My`+`Root`, and sideloads the manifest via the HKCU Office developer add-in path. The outlook-com sidecar is bundled as a PyInstaller `.exe` and spawned in the user session by the bridge — no Windows service. AppSource submission uses the unified manifest; Microsoft auto-generates the legacy XML fallback.
+- W3 rule applies: `build/`, `dist/` junctioned to `C:\builds\office-ai-assistant\`. W2 (`node_modules`) is bypassed for pnpm projects per the updated rule (pnpm's content-addressable store at `%LocalAppData%\pnpm\store\` already keeps heavy data off OneDrive).
