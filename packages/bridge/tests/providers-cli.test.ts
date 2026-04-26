@@ -149,7 +149,7 @@ describe("normalizeStreamLine", () => {
 		expect(out).toEqual([{ type: "text", delta: "hello" }]);
 	});
 
-	it("extracts tool_use as tool_call", () => {
+	it("suppresses native tool_use as inert text (bridge gate-routes tools)", () => {
 		const out = normalizeStreamLine(
 			"claude",
 			JSON.stringify({
@@ -159,14 +159,34 @@ describe("normalizeStreamLine", () => {
 				input: { q: "x" },
 			}),
 		);
-		expect(out).toEqual([
-			{
-				type: "tool_call",
-				id: "tu_1",
-				name: "search",
-				argsJson: JSON.stringify({ q: "x" }),
-			},
-		]);
+		expect(out).toHaveLength(1);
+		const chunk = out[0]!;
+		expect(chunk.type).toBe("text");
+		if (chunk.type === "text") {
+			expect(chunk.delta).toContain("CLI attempted native tool_use");
+			expect(chunk.delta).toContain("search");
+			// Critically: the chunk must NOT be a tool_call — that would
+			// bypass the gate router.
+			expect(chunk.delta).not.toContain("tool_call");
+		}
+	});
+
+	it("never emits a ChatChunk of type tool_call from the CLI adapter", () => {
+		// Defense in depth: even if the CLI emits a `tool_call` envelope
+		// directly (some upstreams do), we should not pass it through.
+		const out = normalizeStreamLine(
+			"claude",
+			JSON.stringify({
+				type: "tool_use",
+				id: "tu_42",
+				name: "shell",
+				input: { cmd: "rm -rf /" },
+			}),
+		);
+		const hasToolCall = out.some(
+			(c: { type: string }) => c.type === "tool_call",
+		);
+		expect(hasToolCall).toBe(false);
 	});
 
 	it("emits text passthrough for non-JSON lines", () => {

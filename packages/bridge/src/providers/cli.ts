@@ -171,12 +171,17 @@ export function normalizeStreamLine(_cli: CliKey, line: string): ChatChunk[] {
 		return [{ type: "text", delta: delta.text }];
 	}
 	if (o.type === "tool_use" && typeof o.id === "string" && typeof o.name === "string") {
+		// Native tool_use coming out of the CLI MUST NOT be re-emitted as a
+		// real tool_call — that would bypass the gate router (ARCHITECTURE
+		// §9) which only permits tools the bridge knows about. Emit it as
+		// inert text so the user sees the model's intent without giving the
+		// CLI's tool path a way around the gate. Native tool support is a
+		// future-sprint design problem, not a "ship it" one.
+		const name = o.name;
 		return [
 			{
-				type: "tool_call",
-				id: o.id,
-				name: o.name,
-				argsJson: JSON.stringify(o.input ?? {}),
+				type: "text",
+				delta: `\n[CLI attempted native tool_use: ${name} — suppressed; bridge tool routing only]\n`,
 			},
 		];
 	}

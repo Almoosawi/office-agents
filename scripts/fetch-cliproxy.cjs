@@ -26,6 +26,7 @@ const path = require("node:path");
 const { createHash } = require("node:crypto");
 const https = require("node:https");
 const { execFileSync } = require("node:child_process");
+const { recycle } = require("./recycle.cjs");
 
 const VENDOR_DIR = path.resolve(__dirname, "..", "vendor", "cliproxy");
 const VERSION_FILE = path.join(VENDOR_DIR, "VERSION.json");
@@ -93,9 +94,11 @@ function httpsGetJson(url, headers = {}) {
 function downloadTo(url, destPath) {
 	return new Promise((resolve, reject) => {
 		const file = fs.createWriteStream(destPath);
+		// Honor rule #0: failed downloads still go through the Recycle Bin
+		// rather than fs.rmSync, so a half-fetched archive is recoverable.
 		const onError = (err) => {
 			file.close();
-			fs.rmSync(destPath, { force: true });
+			recycle([destPath]);
 			reject(err);
 		};
 		https
@@ -109,7 +112,7 @@ function downloadTo(url, destPath) {
 				(res) => {
 					if (res.statusCode === 302 || res.statusCode === 301) {
 						file.close();
-						fs.rmSync(destPath, { force: true });
+						recycle([destPath]);
 						return resolve(downloadTo(res.headers.location, destPath));
 					}
 					if (res.statusCode !== 200) {
@@ -260,7 +263,7 @@ async function main() {
 
 	// Extract into a scratch dir then move the exe + LICENSE into VENDOR_DIR.
 	const scratch = path.join(VENDOR_DIR, ".scratch");
-	fs.rmSync(scratch, { recursive: true, force: true });
+	recycle([scratch]);
 	fs.mkdirSync(scratch, { recursive: true });
 	expandZip(zipPath, scratch);
 
@@ -289,7 +292,7 @@ async function main() {
 			path.join(VENDOR_DIR, path.basename(configExample)),
 		);
 	}
-	fs.rmSync(scratch, { recursive: true, force: true });
+	recycle([scratch]);
 	// Keep the zip cached so re-runs don't re-download. .gitignored.
 
 	console.log(`[fetch-cliproxy] installed -> ${finalExePath}`);

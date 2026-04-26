@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import { join } from "node:path";
 import { CliProxyManager } from "../src/sidecar/cliproxy.js";
+
+const requireCjs = createRequire(import.meta.url);
+const { recycle } = requireCjs("../../../scripts/recycle.cjs") as {
+	recycle: (paths: string[]) => number;
+};
 
 function fakeChild(opts: {
 	exitCodeAfterMs?: number;
@@ -47,7 +53,7 @@ function tmpDir(prefix: string): string {
 }
 
 afterEach(() => {
-	for (const d of scratchDirs) rmSync(d, { recursive: true, force: true });
+	if (scratchDirs.length > 0) recycle(scratchDirs);
 	scratchDirs = [];
 });
 

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -15,6 +16,11 @@ import type {
   BridgeSessionSnapshot,
   BridgeWireMessage,
 } from "../src/protocol";
+
+const requireCjs = createRequire(import.meta.url);
+const { recycle } = requireCjs("../../../scripts/recycle.cjs") as {
+  recycle: (paths: string[]) => number;
+};
 
 const silentLogger = {
   log: () => undefined,
@@ -142,7 +148,7 @@ describe("bridge server", () => {
       server = null;
     }
     if (tlsDir) {
-      rmSync(tlsDir, { recursive: true, force: true });
+      recycle([tlsDir]);
       tlsDir = "";
     }
   });
