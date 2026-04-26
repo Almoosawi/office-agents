@@ -1,9 +1,10 @@
 <script lang="ts">
   // Dev-only floating panel that exercises the bridge WS chat path.
   // Lets you smoke-test cli:claude / cli:codex / cli:gemini / sidecar
-  // entries against a live bridge without leaving Excel. Production
-  // builds tree-shake this out via the import.meta.env.DEV gate in
-  // app.svelte.
+  // entries against a live bridge without leaving the host app
+  // (Word / Excel / PowerPoint / Outlook). Production builds
+  // tree-shake this via the import.meta.env.DEV gate the host's
+  // app.svelte places around the mount.
 
   import { onDestroy } from "svelte";
   import type {

@@ -4,9 +4,9 @@
     ChatInterface,
     ErrorBoundary,
   } from "@office-agents/core";
+  import DevBridgePanel from "@office-agents/core/dev/dev-bridge-panel.svelte";
   import { onMount } from "svelte";
   import { createExcelAdapter } from "../../lib/adapter";
-  import DevBridgePanel from "./dev-bridge-panel.svelte";
   import type { OfficeBridgeController } from "@office-agents/bridge/client";
 
   const adapter = createExcelAdapter();
