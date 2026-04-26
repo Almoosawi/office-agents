@@ -51,6 +51,11 @@ const OPTIONS = {
   range: { type: "string" as const },
   "slide-index": { type: "string" as const },
   slide: { type: "string" as const },
+  provider: { type: "string" as const },
+  message: { type: "string" as const },
+  system: { type: "string" as const },
+  model: { type: "string" as const },
+  token: { type: "string" as const },
 };
 
 interface Cli {
@@ -115,6 +120,7 @@ Commands:
   vfs pull [session] <remotePath> [localPath]
   vfs push [session] <localPath> <remotePath>
   vfs rm [session] <remotePath>
+  chat --provider <id> --message <text> [--system <text>] [--model <name>] [--token <bearer>]
 
 Examples:
   office-bridge serve
@@ -415,12 +421,14 @@ async function commandServe(cli: Cli) {
   // permissions, etc.), the bridge still serves session RPC — provider
   // routes just won't be mounted.
   let providersDeps: import("./server.js").BridgeServerOptions["providers"];
+  let chatDeps: import("./server.js").BridgeServerOptions["chat"];
   try {
     const { openMemoryDb } = await import("./memory/db.js");
     const { MemoryRepository } = await import("./memory/repository.js");
     const { ProviderRegistry } = await import("./providers/registry.js");
     const { ProviderRouter } = await import("./providers/router.js");
     const { createSidecarAdapter } = await import("./providers/sidecar.js");
+    const { ChatDispatcher } = await import("./providers/chat-dispatcher.js");
     const { loadOrCreateToken } = await import("./auth/token.js");
     const db = openMemoryDb();
     const repo = new MemoryRepository(db);
@@ -437,6 +445,10 @@ async function commandServe(cli: Cli) {
     // creates it under %LocalAppData%\OfficeAIAssistant\auth\.
     const auth = loadOrCreateToken();
     providersDeps = { registry, router, authToken: auth.token };
+    chatDeps = {
+      dispatcher: new ChatDispatcher(router),
+      authToken: auth.token,
+    };
     if (auth.source === "generated") {
       console.log(
         `[bridge] generated bridge auth token at ${auth.path}`,
@@ -454,7 +466,12 @@ async function commandServe(cli: Cli) {
 
   let server: BridgeServerHandle | null = null;
   try {
-    server = await createBridgeServer({ host, port, providers: providersDeps });
+    server = await createBridgeServer({
+      host,
+      port,
+      providers: providersDeps,
+      chat: chatDeps,
+    });
   } catch (error) {
     if (
       error instanceof Error &&
@@ -755,6 +772,134 @@ async function commandScreenshot(cli: Cli) {
 // VFS — each subcommand has explicit positional definitions
 // ---------------------------------------------------------------------------
 
+async function commandChat(cli: Cli): Promise<void> {
+  const provider = str(cli, "provider");
+  const message = str(cli, "message");
+  if (!provider) {
+    throw new Error("Usage: office-bridge chat --provider <id> --message <text>");
+  }
+  if (!message && !flag(cli, "stdin") && process.stdin.isTTY) {
+    throw new Error(
+      "Provide --message <text>, --stdin, or pipe input on stdin.",
+    );
+  }
+  const userText = message ?? (await readStdin());
+  if (!userText.trim()) throw new Error("empty message");
+
+  const messages: Array<{ role: string; content: string }> = [];
+  const sys = str(cli, "system");
+  if (sys) messages.push({ role: "system", content: sys });
+  messages.push({ role: "user", content: userText });
+
+  // Bearer token: explicit flag wins; otherwise pull from disk so the
+  // user doesn't have to think about it. Mirrors loadOrCreateToken's
+  // resolution order so launcher + CLI agree on the same file.
+  let token = str(cli, "token");
+  if (!token) {
+    try {
+      const { loadOrCreateToken } = await import("./auth/token.js");
+      token = loadOrCreateToken().token;
+    } catch (e) {
+      throw new Error(
+        `could not load bridge auth token (${(e as Error).message}); pass --token or set OFFICE_AI_BRIDGE_TOKEN`,
+      );
+    }
+  }
+
+  const url = `${baseUrl(cli)}/api/providers/${encodeURIComponent(provider)}/chat`;
+
+  // Skip TLS verification for the self-signed dev cert. Loopback only.
+  const dispatcher = new (
+    await import("node:https")
+  ).Agent({ rejectUnauthorized: false });
+
+  const controller = new AbortController();
+  const onSig = () => controller.abort();
+  process.on("SIGINT", onSig);
+  process.on("SIGTERM", onSig);
+
+  const body: Record<string, unknown> = { messages };
+  const model = str(cli, "model");
+  if (model) body.model = model;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+    // @ts-expect-error — undici-extension; ignored on browsers but Node honors it.
+    dispatcher,
+  });
+
+  if (!response.ok || !response.body) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status}: ${text || "(no body)"}`);
+  }
+
+  const decoder = new TextDecoder();
+  let buf = "";
+  let info: { chosen?: string; fallbackUsed?: boolean } | null = null;
+
+  for await (const piece of response.body as unknown as AsyncIterable<Uint8Array>) {
+    buf += decoder.decode(piece, { stream: true });
+    let idx = buf.indexOf("\n");
+    while (idx >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (line) handleNdjsonLine(cli, line, (i) => (info = i));
+      idx = buf.indexOf("\n");
+    }
+  }
+  if (buf.trim()) handleNdjsonLine(cli, buf.trim(), (i) => (info = i));
+
+  process.off("SIGINT", onSig);
+  process.off("SIGTERM", onSig);
+
+  if (info && !flag(cli, "json")) {
+    process.stderr.write(
+      `\n[chat] provider=${info.chosen}${info.fallbackUsed ? " (fallback)" : ""}\n`,
+    );
+  }
+}
+
+function handleNdjsonLine(
+  cli: Cli,
+  line: string,
+  setInfo: (info: { chosen?: string; fallbackUsed?: boolean }) => void,
+): void {
+  let parsed: { kind: string } & Record<string, unknown>;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return; // ignore malformed line
+  }
+  if (flag(cli, "json")) {
+    console.log(line);
+    return;
+  }
+  if (parsed.kind === "chunk") {
+    const chunk = parsed.chunk as { kind: string } & Record<string, unknown>;
+    if (chunk.kind === "text") process.stdout.write(chunk.delta as string);
+    else if (chunk.kind === "error")
+      process.stderr.write(`\n[error] ${chunk.message}\n`);
+    else if (chunk.kind === "tool_call")
+      process.stderr.write(
+        `\n[tool_call] ${chunk.name as string} ${chunk.argsJson as string}\n`,
+      );
+    else if (chunk.kind === "done") process.stdout.write("\n");
+    return;
+  }
+  if (parsed.kind === "info") {
+    setInfo({
+      chosen: parsed.chosen as string,
+      fallbackUsed: parsed.fallbackUsed as boolean,
+    });
+  }
+}
+
 async function commandVfs(cli: Cli) {
   const subcommand = cli.positionals[1];
   if (!subcommand)
@@ -891,6 +1036,7 @@ const COMMANDS: Record<string, (cli: Cli) => Promise<void>> = {
   rpc: commandRpc,
   screenshot: commandScreenshot,
   vfs: commandVfs,
+  chat: commandChat,
 };
 
 async function main() {

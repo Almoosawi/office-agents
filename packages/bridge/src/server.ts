@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { type WebSocket, WebSocketServer } from "ws";
 import {
+  type BridgeChatRequestMessage,
   type BridgeError,
   type BridgeEventMessage,
   type BridgeInvokeRequest,
@@ -16,6 +17,7 @@ import {
   type BridgeVfsReadParams,
   type BridgeVfsWriteParams,
   type BridgeWireMessage,
+  chatChunkToWire,
   createBridgeId,
   DEFAULT_BRIDGE_HOST,
   DEFAULT_BRIDGE_PORT,
@@ -24,6 +26,8 @@ import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   extractToolError,
   getDefaultRawExecutionTool,
+  isBridgeChatAbortMessage,
+  isBridgeChatRequestMessage,
   isBridgeEventMessage,
   isBridgeHelloMessage,
   isBridgeResponseMessage,
@@ -31,6 +35,11 @@ import {
   serializeForJson,
   toBridgeError,
 } from "./protocol.js";
+import type { ChatDispatcher } from "./providers/chat-dispatcher.js";
+import {
+  handleProvidersChat,
+  type ProvidersChatHttpDeps,
+} from "./providers/chat-http.js";
 import {
   handleProvidersRoute,
   type ProvidersHttpDeps,
@@ -69,6 +78,12 @@ export interface BridgeServerOptions {
    * bridge can run in pure session-RPC mode for tests / legacy callers.
    */
   providers?: ProvidersHttpDeps;
+  /**
+   * Optional chat dispatcher. When supplied, the server mounts the
+   * streaming POST /api/providers/:id/chat endpoint AND handles
+   * chat_request / chat_abort messages on connected WebSocket sessions.
+   */
+  chat?: Pick<ProvidersChatHttpDeps, "dispatcher" | "authToken">;
 }
 
 export interface BridgeServerHandle {
@@ -218,6 +233,19 @@ export async function createBridgeServer(
       const pathname = url.pathname;
 
       try {
+        // Streaming chat must be matched BEFORE the JSON CRUD routes —
+        // /api/providers/:id matches both, but only chat returns NDJSON.
+        if (options.chat) {
+          const handled = await handleProvidersChat(
+            req,
+            res,
+            pathname,
+            options.chat,
+            { readJson: readJsonBody, writeJson: jsonResponse },
+          );
+          if (handled) return;
+        }
+
         if (options.providers) {
           const handled = await handleProvidersRoute(
             req,
@@ -566,6 +594,52 @@ export async function createBridgeServer(
     pending.reject(error);
   }
 
+  async function handleChatRequest(
+    sessionId: string,
+    socket: WebSocket,
+    message: BridgeChatRequestMessage,
+  ): Promise<void> {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+
+    if (!options.chat) {
+      socketSend(socket, {
+        type: "chat_chunk",
+        requestId: message.requestId,
+        chunk: {
+          kind: "error",
+          message: "chat dispatcher not configured on this bridge",
+        },
+      });
+      socketSend(socket, {
+        type: "chat_chunk",
+        requestId: message.requestId,
+        chunk: { kind: "done", reason: "error" },
+      });
+      return;
+    }
+
+    const sendChunk = (chunk: Parameters<typeof chatChunkToWire>[0]) => {
+      socketSend(socket, {
+        type: "chat_chunk",
+        requestId: message.requestId,
+        chunk: chatChunkToWire(chunk),
+      });
+    };
+
+    try {
+      await options.chat.dispatcher.start({
+        requestId: message.requestId,
+        providerId: message.providerId,
+        request: message.request,
+        onChunk: sendChunk,
+      });
+    } catch {
+      // Dispatcher already pushed error+done chunks. Resolution failure
+      // throws after notifying onChunk; nothing else to surface.
+    }
+  }
+
   wsServer.on("connection", (socket) => {
     let sessionId: string | null = null;
 
@@ -624,6 +698,21 @@ export async function createBridgeServer(
 
       if (isBridgeResponseMessage(message)) {
         handleSessionResponse(sessionId, message);
+        return;
+      }
+
+      if (isBridgeChatRequestMessage(message)) {
+        handleChatRequest(sessionId, socket, message).catch((error) => {
+          logger.warn(`[bridge] chat dispatch failed: ${error.message ?? error}`);
+        });
+        return;
+      }
+
+      if (isBridgeChatAbortMessage(message)) {
+        if (options.chat) {
+          options.chat.dispatcher.abort(message.requestId);
+        }
+        return;
       }
     });
 
@@ -740,6 +829,11 @@ export async function createBridgeServer(
     },
     invokeSession: invokeSessionInternal,
     close: async () => {
+      // Abort any in-flight chats so adapters kill their child processes
+      // / outbound HTTP connections before we drop the WS sockets.
+      if (options.chat) {
+        options.chat.dispatcher.abortAll();
+      }
       for (const session of sessions.values()) {
         try {
           session.socket.close(1001, "bridge server shutting down");

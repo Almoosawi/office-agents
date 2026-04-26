@@ -284,6 +284,101 @@ describe("bridge server", () => {
     expect(result.result.resultText).toBe("42");
   });
 
+  it("dispatches chat_request via WebSocket and streams chat_chunk frames back", async () => {
+    const { closeMemoryDb, openMemoryDb } = await import("../src/memory/db");
+    const { MemoryRepository } = await import("../src/memory/repository");
+    const { ProviderRegistry } = await import("../src/providers/registry");
+    const { ProviderRouter } = await import("../src/providers/router");
+    const { ChatDispatcher } = await import("../src/providers/chat-dispatcher");
+
+    const db = openMemoryDb({ dbPath: ":memory:" });
+    const repo = new MemoryRepository(db);
+    const registry = new ProviderRegistry(repo);
+    registry.load();
+
+    const router = new ProviderRouter({
+      registry,
+      adapters: {
+        cli: {
+          kind: "cli",
+          async probe() {
+            return { available: true };
+          },
+          async listModels() {
+            return [];
+          },
+          async *chat() {
+            yield { type: "text", delta: "ping " } as const;
+            yield { type: "text", delta: "pong" } as const;
+            yield { type: "done", reason: "stop" } as const;
+          },
+        },
+      },
+    });
+    const dispatcher = new ChatDispatcher(router);
+
+    const tls = createTempTlsMaterial();
+    tlsDir = tls.dir;
+    const port = await getFreePort();
+    server = await createBridgeServer({
+      host: "127.0.0.1",
+      port,
+      certPath: tls.certPath,
+      keyPath: tls.keyPath,
+      logger: silentLogger,
+      chat: { dispatcher },
+    });
+
+    try {
+      socket = await connectClient(server.wsUrl);
+      socket.send(
+        JSON.stringify({
+          type: "hello",
+          role: "office-addin",
+          protocolVersion: 1,
+          snapshot: createSnapshot(),
+        }),
+      );
+      await waitForParsedMessage(socket); // welcome
+
+      const collected: BridgeWireMessage[] = [];
+      const allChunks = new Promise<void>((resolve) => {
+        socket!.on("message", (raw: Buffer) => {
+          const msg = JSON.parse(raw.toString("utf8")) as BridgeWireMessage;
+          if (msg.type !== "chat_chunk") return;
+          collected.push(msg);
+          if (
+            msg.chunk.kind === "done" ||
+            msg.chunk.kind === "error"
+          ) {
+            resolve();
+          }
+        });
+      });
+
+      socket.send(
+        JSON.stringify({
+          type: "chat_request",
+          requestId: "ws-r1",
+          providerId: "cli:claude",
+          request: { messages: [{ role: "user", content: "hi" }] },
+        }),
+      );
+
+      await allChunks;
+
+      expect(collected).toHaveLength(3);
+      const kinds = collected.map(
+        (m) => (m as { chunk: { kind: string } }).chunk.kind,
+      );
+      expect(kinds).toEqual(["text", "text", "done"]);
+      expect(collected.every((m) => (m as { requestId: string }).requestId === "ws-r1")).toBe(true);
+    } finally {
+      db.close();
+      closeMemoryDb();
+    }
+  });
+
   it("rejects pending invocations when the WebSocket session disconnects mid-request", async () => {
     const tls = createTempTlsMaterial();
     tlsDir = tls.dir;
