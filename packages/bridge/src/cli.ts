@@ -421,6 +421,7 @@ async function commandServe(cli: Cli) {
     const { ProviderRegistry } = await import("./providers/registry.js");
     const { ProviderRouter } = await import("./providers/router.js");
     const { createSidecarAdapter } = await import("./providers/sidecar.js");
+    const { loadOrCreateToken } = await import("./auth/token.js");
     const db = openMemoryDb();
     const repo = new MemoryRepository(db);
     const registry = new ProviderRegistry(repo);
@@ -432,7 +433,19 @@ async function commandServe(cli: Cli) {
       registry,
       adapters: { sidecar: createSidecarAdapter() },
     });
-    providersDeps = { registry, router };
+    // Bearer token gates mutating /api/providers/* endpoints. First run
+    // creates it under %LocalAppData%\OfficeAIAssistant\auth\.
+    const auth = loadOrCreateToken();
+    providersDeps = { registry, router, authToken: auth.token };
+    if (auth.source === "generated") {
+      console.log(
+        `[bridge] generated bridge auth token at ${auth.path}`,
+      );
+    } else if (auth.source === "env") {
+      console.log("[bridge] using bridge auth token from OFFICE_AI_BRIDGE_TOKEN");
+    } else if (auth.source === "file") {
+      console.log(`[bridge] loaded bridge auth token from ${auth.path}`);
+    }
   } catch (e) {
     console.warn(
       `[bridge] provider routes disabled: ${(e as Error).message}`,

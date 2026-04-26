@@ -5,12 +5,17 @@
 //
 // Endpoints (all loopback-only, JSON):
 //   GET    /api/providers                  -> ProviderEntry[]
-//   POST   /api/providers/reset            -> ProviderEntry[] (defaults)
+//   POST   /api/providers/reset            -> ProviderEntry[] (defaults)   [bearer]
 //   GET    /api/providers/:id              -> ProviderEntry | 404
-//   PUT    /api/providers/:id              -> ProviderEntry (upsert; body = entry)
-//   DELETE /api/providers/:id              -> { ok: boolean }
-//   POST   /api/providers/:id/probe        -> ProbeResult
+//   PUT    /api/providers/:id              -> ProviderEntry (upsert)       [bearer]
+//   DELETE /api/providers/:id              -> { ok: boolean }              [bearer]
+//   POST   /api/providers/:id/probe        -> ProbeResult                  [bearer]
 //   GET    /api/providers/:id/models       -> { models: string[] }
+//
+// Auth: mutating endpoints require `Authorization: Bearer <token>` matching
+// `deps.authToken` — TLS alone won't stop a hostile web origin from POSTing
+// to 127.0.0.1. When `deps.authToken` is undefined, the gate is open (used
+// by tests that exercise validation logic without auth coupling).
 //
 // Privacy: ProviderEntry payloads NEVER contain secrets — `api_key_ref`
 // holds an opaque keychain reference, not the key itself. Even so, the
@@ -18,13 +23,23 @@
 // loopback-restricted.
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+	extractBearer,
+	timingSafeEqualString,
+} from "../auth/token.js";
 import type { ProviderRegistry } from "./registry.js";
 import type { ProviderRouter } from "./router.js";
 import type { ProviderEntry } from "./types.js";
+import { validateProviderEntry } from "./validation.js";
 
 export interface ProvidersHttpDeps {
 	registry: ProviderRegistry;
 	router: ProviderRouter;
+	/**
+	 * Bearer token required for mutating endpoints. When undefined, the gate
+	 * is open — use only in tests that don't need to exercise auth.
+	 */
+	authToken?: string;
 }
 
 interface JsonBody {
@@ -42,20 +57,11 @@ function sanitize(entry: ProviderEntry): ProviderEntry {
 	return entry;
 }
 
-function isProviderEntry(value: unknown): value is ProviderEntry {
-	if (typeof value !== "object" || value === null) return false;
-	const v = value as Record<string, unknown>;
-	if (typeof v.id !== "string" || !v.id) return false;
-	if (
-		v.kind !== "cli" &&
-		v.kind !== "sidecar" &&
-		v.kind !== "local" &&
-		v.kind !== "byok"
-	)
-		return false;
-	if (typeof v.label !== "string") return false;
-	if (typeof v.enabled !== "boolean") return false;
-	return true;
+function isAuthorized(req: IncomingMessage, expected: string | undefined): boolean {
+	if (!expected) return true; // gate disabled
+	const got = extractBearer(req.headers.authorization);
+	if (!got) return false;
+	return timingSafeEqualString(got, expected);
 }
 
 /**
@@ -69,7 +75,7 @@ export async function handleProvidersRoute(
 	deps: ProvidersHttpDeps,
 	helpers: { readJson: JsonBody; writeJson: JsonResponse },
 ): Promise<boolean> {
-	const { registry, router } = deps;
+	const { registry, router, authToken } = deps;
 	const { readJson, writeJson } = helpers;
 
 	if (!pathname.startsWith("/api/providers")) return false;
@@ -89,6 +95,13 @@ export async function handleProvidersRoute(
 
 	if (pathname === "/api/providers/reset") {
 		if (req.method === "POST") {
+			if (!isAuthorized(req, authToken)) {
+				writeJson(res, 401, {
+					ok: false,
+					error: { message: "missing or invalid bearer token" },
+				});
+				return true;
+			}
 			const fresh = registry.resetToDefaults();
 			writeJson(res, 200, { ok: true, providers: fresh.map(sanitize) });
 			return true;
@@ -115,6 +128,13 @@ export async function handleProvidersRoute(
 			return true;
 		}
 		if (req.method === "PUT") {
+			if (!isAuthorized(req, authToken)) {
+				writeJson(res, 401, {
+					ok: false,
+					error: { message: "missing or invalid bearer token" },
+				});
+				return true;
+			}
 			let body: unknown;
 			try {
 				body = await readJson(req);
@@ -125,25 +145,36 @@ export async function handleProvidersRoute(
 				});
 				return true;
 			}
-			if (!isProviderEntry(body)) {
+			const validated = validateProviderEntry(body);
+			if (validated.ok !== true) {
 				writeJson(res, 400, {
 					ok: false,
-					error: { message: "body must be a ProviderEntry" },
+					error: { message: validated.error },
 				});
 				return true;
 			}
-			if (body.id !== id) {
+			const entry = validated.entry;
+			if (entry.id !== id) {
 				writeJson(res, 400, {
 					ok: false,
-					error: { message: `body.id (${body.id}) must match URL id (${id})` },
+					error: {
+						message: `body.id (${entry.id}) must match URL id (${id})`,
+					},
 				});
 				return true;
 			}
-			registry.upsert(body);
-			writeJson(res, 200, { ok: true, provider: sanitize(body) });
+			registry.upsert(entry);
+			writeJson(res, 200, { ok: true, provider: sanitize(entry) });
 			return true;
 		}
 		if (req.method === "DELETE") {
+			if (!isAuthorized(req, authToken)) {
+				writeJson(res, 401, {
+					ok: false,
+					error: { message: "missing or invalid bearer token" },
+				});
+				return true;
+			}
 			const removed = registry.remove(id);
 			writeJson(res, removed ? 200 : 404, { ok: removed });
 			return true;
@@ -153,6 +184,13 @@ export async function handleProvidersRoute(
 	}
 
 	if (sub === "/probe" && req.method === "POST") {
+		if (!isAuthorized(req, authToken)) {
+			writeJson(res, 401, {
+				ok: false,
+				error: { message: "missing or invalid bearer token" },
+			});
+			return true;
+		}
 		try {
 			const decision = await router.resolve(id);
 			writeJson(res, 200, {
