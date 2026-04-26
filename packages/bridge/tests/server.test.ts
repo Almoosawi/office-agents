@@ -379,6 +379,228 @@ describe("bridge server", () => {
     }
   });
 
+  it("aborts in-flight chat when the WebSocket session disconnects", async () => {
+    const { closeMemoryDb, openMemoryDb } = await import("../src/memory/db");
+    const { MemoryRepository } = await import("../src/memory/repository");
+    const { ProviderRegistry } = await import("../src/providers/registry");
+    const { ProviderRouter } = await import("../src/providers/router");
+    const { ChatDispatcher } = await import("../src/providers/chat-dispatcher");
+
+    const db = openMemoryDb({ dbPath: ":memory:" });
+    const repo = new MemoryRepository(db);
+    const registry = new ProviderRegistry(repo);
+    registry.load();
+
+    // Adapter that yields one chunk then waits forever — only req.signal
+    // can break it out. If WS-disconnect cleanup is wired correctly, the
+    // dispatcher will fire the signal and the iterator exits cleanly.
+    const router = new ProviderRouter({
+      registry,
+      adapters: {
+        cli: {
+          kind: "cli",
+          async probe() {
+            return { available: true };
+          },
+          async listModels() {
+            return [];
+          },
+          async *chat(_e, req) {
+            yield { type: "text", delta: "first" } as const;
+            await new Promise<void>((resolve) => {
+              if (req.signal?.aborted) return resolve();
+              req.signal?.addEventListener("abort", () => resolve(), {
+                once: true,
+              });
+            });
+            yield { type: "done", reason: "abort" } as const;
+          },
+        },
+      },
+    });
+    const dispatcher = new ChatDispatcher(router);
+
+    const tls = createTempTlsMaterial();
+    tlsDir = tls.dir;
+    const port = await getFreePort();
+    server = await createBridgeServer({
+      host: "127.0.0.1",
+      port,
+      certPath: tls.certPath,
+      keyPath: tls.keyPath,
+      logger: silentLogger,
+      chat: { dispatcher },
+    });
+
+    try {
+      socket = await connectClient(server.wsUrl);
+      socket.send(
+        JSON.stringify({
+          type: "hello",
+          role: "office-addin",
+          protocolVersion: 1,
+          snapshot: createSnapshot(),
+        }),
+      );
+      await waitForParsedMessage(socket); // welcome
+
+      const firstChunk = waitForParsedMessage(socket);
+      socket.send(
+        JSON.stringify({
+          type: "chat_request",
+          requestId: "ws-disconnect",
+          providerId: "cli:claude",
+          request: { messages: [{ role: "user", content: "x" }] },
+        }),
+      );
+      await firstChunk;
+      expect(dispatcher.activeCount()).toBe(1);
+
+      // Drop the socket — server's removeSession should abort the chat.
+      socket.terminate();
+      socket = null;
+
+      // Wait for dispatcher to clear the abort table.
+      const start = Date.now();
+      while (dispatcher.activeCount() !== 0 && Date.now() - start < 2_000) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(dispatcher.activeCount()).toBe(0);
+    } finally {
+      db.close();
+      closeMemoryDb();
+    }
+  });
+
+  it("isolates chat requestIds across sessions (no cross-session abort)", async () => {
+    const { closeMemoryDb, openMemoryDb } = await import("../src/memory/db");
+    const { MemoryRepository } = await import("../src/memory/repository");
+    const { ProviderRegistry } = await import("../src/providers/registry");
+    const { ProviderRouter } = await import("../src/providers/router");
+    const { ChatDispatcher } = await import("../src/providers/chat-dispatcher");
+
+    const db = openMemoryDb({ dbPath: ":memory:" });
+    const repo = new MemoryRepository(db);
+    const registry = new ProviderRegistry(repo);
+    registry.load();
+
+    // Adapter yields one chunk, then blocks on signal. Test holds two
+    // concurrent chats with the SAME wire requestId across two sessions.
+    const router = new ProviderRouter({
+      registry,
+      adapters: {
+        cli: {
+          kind: "cli",
+          async probe() {
+            return { available: true };
+          },
+          async listModels() {
+            return [];
+          },
+          async *chat(_e, req) {
+            yield { type: "text", delta: "tag" } as const;
+            await new Promise<void>((resolve) => {
+              if (req.signal?.aborted) return resolve();
+              req.signal?.addEventListener("abort", () => resolve(), {
+                once: true,
+              });
+            });
+            yield { type: "done", reason: "abort" } as const;
+          },
+        },
+      },
+    });
+    const dispatcher = new ChatDispatcher(router);
+
+    const tls = createTempTlsMaterial();
+    tlsDir = tls.dir;
+    const port = await getFreePort();
+    server = await createBridgeServer({
+      host: "127.0.0.1",
+      port,
+      certPath: tls.certPath,
+      keyPath: tls.keyPath,
+      logger: silentLogger,
+      chat: { dispatcher },
+    });
+
+    let socketA: WebSocket | null = null;
+    let socketB: WebSocket | null = null;
+    try {
+      socketA = await connectClient(server.wsUrl);
+      socketB = await connectClient(server.wsUrl);
+
+      socketA.send(
+        JSON.stringify({
+          type: "hello",
+          role: "office-addin",
+          protocolVersion: 1,
+          snapshot: createSnapshot({ sessionId: "excel:A" }),
+        }),
+      );
+      socketB.send(
+        JSON.stringify({
+          type: "hello",
+          role: "office-addin",
+          protocolVersion: 1,
+          snapshot: createSnapshot({ sessionId: "excel:B" }),
+        }),
+      );
+      await waitForParsedMessage(socketA);
+      await waitForParsedMessage(socketB);
+
+      const firstA = waitForParsedMessage(socketA);
+      const firstB = waitForParsedMessage(socketB);
+      const SHARED_ID = "shared-r1";
+      socketA.send(
+        JSON.stringify({
+          type: "chat_request",
+          requestId: SHARED_ID,
+          providerId: "cli:claude",
+          request: { messages: [{ role: "user", content: "a" }] },
+        }),
+      );
+      socketB.send(
+        JSON.stringify({
+          type: "chat_request",
+          requestId: SHARED_ID,
+          providerId: "cli:claude",
+          request: { messages: [{ role: "user", content: "b" }] },
+        }),
+      );
+      await Promise.all([firstA, firstB]);
+      expect(dispatcher.activeCount()).toBe(2);
+
+      // Session A aborts ITS request — must NOT abort B's.
+      socketA.send(
+        JSON.stringify({ type: "chat_abort", requestId: SHARED_ID }),
+      );
+
+      // A should observe done(abort); B should still be running.
+      const aDone = await waitForParsedMessage(socketA);
+      expect(aDone.type).toBe("chat_chunk");
+      expect((aDone as { chunk: { kind: string; reason?: string } }).chunk).toEqual({
+        kind: "done",
+        reason: "abort",
+      });
+      // dispatcher.activeCount drops by exactly one.
+      expect(dispatcher.activeCount()).toBe(1);
+
+      // Now abort B for cleanup.
+      socketB.send(
+        JSON.stringify({ type: "chat_abort", requestId: SHARED_ID }),
+      );
+      const bDone = await waitForParsedMessage(socketB);
+      expect((bDone as { chunk: { kind: string } }).chunk.kind).toBe("done");
+      expect(dispatcher.activeCount()).toBe(0);
+    } finally {
+      socketA?.terminate();
+      socketB?.terminate();
+      db.close();
+      closeMemoryDb();
+    }
+  });
+
   it("rejects pending invocations when the WebSocket session disconnects mid-request", async () => {
     const tls = createTempTlsMaterial();
     tlsDir = tls.dir;

@@ -241,6 +241,14 @@ export async function* chatOpenAiCompat(
 			for (const c of toChatChunks(buf)) yield c;
 		}
 	} catch (e) {
+		// Abort is not an error: when the dispatcher fires req.signal,
+		// undici throws AbortError out of reader.read(). Surface that as
+		// a clean done(abort) so chat_abort renders correctly in the
+		// taskpane instead of looking like a transport failure.
+		if (req.signal?.aborted) {
+			yield { type: "done", reason: "abort" };
+			return;
+		}
 		yield { type: "error", message: (e as Error).message };
 		yield { type: "done", reason: "error" };
 	}

@@ -62,6 +62,13 @@ export interface BridgeSessionRecord {
 interface SessionState extends BridgeSessionRecord {
   socket: WebSocket;
   pending: Map<string, PendingRequest>;
+  /**
+   * Wire requestIds of chats currently dispatched on this session's
+   * behalf. Keys mirror the values the taskpane sent us. The dispatcher
+   * stores them under namespaced keys (see `chatKey()`) so two sessions
+   * can't collide or abort each other's chats.
+   */
+  activeChats: Set<string>;
 }
 
 export interface BridgeServerOptions {
@@ -538,6 +545,13 @@ export async function createBridgeServer(
 
   const wsServer = new WebSocketServer({ noServer: true });
 
+  function chatKey(sessionId: string, requestId: string): string {
+    // Namespace dispatcher keys with the WS session so two taskpanes
+    // using the same opaque requestId can't collide, and chat_abort
+    // from one session can't reach into another's chat.
+    return `${sessionId}::${requestId}`;
+  }
+
   function removeSession(sessionId: string, reason: string) {
     const session = sessions.get(sessionId);
     if (!session) return;
@@ -545,6 +559,15 @@ export async function createBridgeServer(
       clearTimeout(pending.timeout);
       pending.reject(new Error(`Bridge session disconnected: ${reason}`));
       session.pending.delete(requestId);
+    }
+    // Abort any chats this session started — the WS is gone, so the
+    // adapter should stop pumping chunks (and tearing down its child
+    // process / outbound HTTP) immediately.
+    if (options.chat && session.activeChats.size > 0) {
+      for (const requestId of session.activeChats) {
+        options.chat.dispatcher.abort(chatKey(sessionId, requestId));
+      }
+      session.activeChats.clear();
     }
     sessions.delete(sessionId);
     logger.log(`[bridge] disconnected ${sessionId} (${reason})`);
@@ -619,6 +642,32 @@ export async function createBridgeServer(
       return;
     }
 
+    // Best-effort safety check — if the wire requestId is already
+    // tracked on this session, reject without touching the dispatcher.
+    // (The dispatcher would also throw, but this gives a tighter error
+    // and never racy-touches another session's namespaced key.)
+    if (session.activeChats.has(message.requestId)) {
+      socketSend(socket, {
+        type: "chat_chunk",
+        requestId: message.requestId,
+        chunk: {
+          kind: "error",
+          message: `chat already in flight for requestId ${message.requestId}`,
+        },
+      });
+      socketSend(socket, {
+        type: "chat_chunk",
+        requestId: message.requestId,
+        chunk: { kind: "done", reason: "error" },
+      });
+      return;
+    }
+
+    // Bound the wire requestId by sessionId. The WIRE id stays opaque
+    // in chat_chunk frames — only the dispatcher key is namespaced.
+    const dispatcherKey = chatKey(sessionId, message.requestId);
+    session.activeChats.add(message.requestId);
+
     const sendChunk = (chunk: Parameters<typeof chatChunkToWire>[0]) => {
       socketSend(socket, {
         type: "chat_chunk",
@@ -629,7 +678,7 @@ export async function createBridgeServer(
 
     try {
       await options.chat.dispatcher.start({
-        requestId: message.requestId,
+        requestId: dispatcherKey,
         providerId: message.providerId,
         request: message.request,
         onChunk: sendChunk,
@@ -637,6 +686,11 @@ export async function createBridgeServer(
     } catch {
       // Dispatcher already pushed error+done chunks. Resolution failure
       // throws after notifying onChunk; nothing else to surface.
+    } finally {
+      // Clean up tracking — session may already be gone (disconnect
+      // mid-stream); guard with a Map lookup.
+      const live = sessions.get(sessionId);
+      if (live) live.activeChats.delete(message.requestId);
     }
   }
 
@@ -667,6 +721,7 @@ export async function createBridgeServer(
           recentEvents: [],
           pending: new Map(),
           pendingCount: 0,
+          activeChats: new Set(),
         };
 
         addStoredEvent(next, eventLimit, "bridge_connected", {
@@ -710,7 +765,10 @@ export async function createBridgeServer(
 
       if (isBridgeChatAbortMessage(message)) {
         if (options.chat) {
-          options.chat.dispatcher.abort(message.requestId);
+          // Only abort chats this session actually started — abort messages
+          // can only reach our own namespaced key, so cross-session aborts
+          // silently no-op.
+          options.chat.dispatcher.abort(chatKey(sessionId, message.requestId));
         }
         return;
       }

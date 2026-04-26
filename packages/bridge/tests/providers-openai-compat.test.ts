@@ -179,4 +179,72 @@ describe("chatOpenAiCompat", () => {
 		expect(out[0]).toMatchObject({ type: "error" });
 		expect(out.at(-1)).toEqual({ type: "done", reason: "error" });
 	});
+
+	it("yields done(abort) — not done(error) — when req.signal aborts mid-stream", async () => {
+		// Stream that throws AbortError out of reader.read() once the
+		// signal is fired — mimics undici's abort behavior.
+		function abortableStream(signal: AbortSignal): ReadableStream<Uint8Array> {
+			const encoder = new TextEncoder();
+			return new ReadableStream({
+				start(controller) {
+					controller.enqueue(
+						encoder.encode(
+							`data: ${JSON.stringify({
+								choices: [{ delta: { content: "partial" } }],
+							})}\n`,
+						),
+					);
+				},
+				pull(controller) {
+					return new Promise((_, reject) => {
+						signal.addEventListener(
+							"abort",
+							() => {
+								controller.error(
+									Object.assign(new Error("aborted"), { name: "AbortError" }),
+								);
+								reject(new Error("aborted"));
+							},
+							{ once: true },
+						);
+					});
+				},
+			});
+		}
+
+		const ctl = new AbortController();
+		const fetchFn = vi.fn(
+			async () =>
+				new Response(abortableStream(ctl.signal), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				}),
+		);
+
+		const collected: Array<{ type: string }> = [];
+		const iter = chatOpenAiCompat(
+			sidecarEntry,
+			{
+				messages: [{ role: "user", content: "ping" }],
+				signal: ctl.signal,
+			},
+			undefined,
+			{ fetchFn: fetchFn as unknown as typeof fetch },
+		);
+
+		// Pump until first chunk lands, then abort.
+		const it = iter[Symbol.asyncIterator]();
+		const first = await it.next();
+		if (!first.done) collected.push(first.value);
+		ctl.abort();
+		for (;;) {
+			const r = await it.next();
+			if (r.done) break;
+			collected.push(r.value);
+		}
+
+		// Must end on done(abort), NOT on error.
+		expect(collected.some((c) => c.type === "error")).toBe(false);
+		expect(collected.at(-1)).toEqual({ type: "done", reason: "abort" });
+	});
 });

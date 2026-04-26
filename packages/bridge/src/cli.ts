@@ -806,57 +806,83 @@ async function commandChat(cli: Cli): Promise<void> {
     }
   }
 
-  const url = `${baseUrl(cli)}/api/providers/${encodeURIComponent(provider)}/chat`;
-
-  // Skip TLS verification for the self-signed dev cert. Loopback only.
-  const dispatcher = new (
-    await import("node:https")
-  ).Agent({ rejectUnauthorized: false });
-
-  const controller = new AbortController();
-  const onSig = () => controller.abort();
-  process.on("SIGINT", onSig);
-  process.on("SIGTERM", onSig);
-
+  const target = new URL(
+    `${baseUrl(cli)}/api/providers/${encodeURIComponent(provider)}/chat`,
+  );
   const body: Record<string, unknown> = { messages };
   const model = str(cli, "model");
   if (model) body.model = model;
+  const payload = JSON.stringify(body);
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-    signal: controller.signal,
-    // @ts-expect-error — undici-extension; ignored on browsers but Node honors it.
-    dispatcher,
-  });
-
-  if (!response.ok || !response.body) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`HTTP ${response.status}: ${text || "(no body)"}`);
-  }
-
-  const decoder = new TextDecoder();
-  let buf = "";
+  // Use node:https.request directly. Global fetch on Node is undici-based
+  // and rejects a node:https.Agent passed as `dispatcher` with
+  // "agent.dispatch is not a function". The existing http-client uses the
+  // same direct-https pattern, so we mirror it here.
+  const { request: httpsRequest } = await import("node:https");
   let info: { chosen?: string; fallbackUsed?: boolean } | null = null;
 
-  for await (const piece of response.body as unknown as AsyncIterable<Uint8Array>) {
-    buf += decoder.decode(piece, { stream: true });
-    let idx = buf.indexOf("\n");
-    while (idx >= 0) {
-      const line = buf.slice(0, idx).trim();
-      buf = buf.slice(idx + 1);
-      if (line) handleNdjsonLine(cli, line, (i) => (info = i));
-      idx = buf.indexOf("\n");
-    }
-  }
-  if (buf.trim()) handleNdjsonLine(cli, buf.trim(), (i) => (info = i));
+  await new Promise<void>((resolve, reject) => {
+    const req = httpsRequest(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname + target.search,
+        method: "POST",
+        rejectUnauthorized: false,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+          Authorization: `Bearer ${token}`,
+        },
+      },
+      (res) => {
+        if (res.statusCode !== 200) {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            reject(
+              new Error(
+                `HTTP ${res.statusCode}: ${
+                  Buffer.concat(chunks).toString("utf8") || "(no body)"
+                }`,
+              ),
+            );
+          });
+          return;
+        }
+        let buf = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk: string) => {
+          buf += chunk;
+          let idx = buf.indexOf("\n");
+          while (idx >= 0) {
+            const line = buf.slice(0, idx).trim();
+            buf = buf.slice(idx + 1);
+            if (line) handleNdjsonLine(cli, line, (i) => (info = i));
+            idx = buf.indexOf("\n");
+          }
+        });
+        res.on("end", () => {
+          if (buf.trim()) handleNdjsonLine(cli, buf.trim(), (i) => (info = i));
+          resolve();
+        });
+        res.on("error", reject);
+      },
+    );
 
-  process.off("SIGINT", onSig);
-  process.off("SIGTERM", onSig);
+    const onSig = () => req.destroy();
+    process.on("SIGINT", onSig);
+    process.on("SIGTERM", onSig);
+    req.on("close", () => {
+      process.off("SIGINT", onSig);
+      process.off("SIGTERM", onSig);
+    });
+    req.on("error", reject);
+
+    req.write(payload);
+    req.end();
+  });
 
   if (info && !flag(cli, "json")) {
     process.stderr.write(
