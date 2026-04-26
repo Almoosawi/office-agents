@@ -422,24 +422,42 @@ async function commandServe(cli: Cli) {
   // routes just won't be mounted.
   let providersDeps: import("./server.js").BridgeServerOptions["providers"];
   let chatDeps: import("./server.js").BridgeServerOptions["chat"];
+  let sidecarSupervisor: import("./sidecar/supervisor.js").SidecarSupervisor | null = null;
   try {
     const { openMemoryDb } = await import("./memory/db.js");
     const { MemoryRepository } = await import("./memory/repository.js");
     const { ProviderRegistry } = await import("./providers/registry.js");
     const { ProviderRouter } = await import("./providers/router.js");
     const { createSidecarAdapter } = await import("./providers/sidecar.js");
+    const { SidecarSupervisor } = await import("./sidecar/supervisor.js");
     const { ChatDispatcher } = await import("./providers/chat-dispatcher.js");
     const { loadOrCreateToken } = await import("./auth/token.js");
     const db = openMemoryDb();
     const repo = new MemoryRepository(db);
     const registry = new ProviderRegistry(repo);
-    // Sidecar adapter without a key supplier yet — the CliProxyManager
-    // is started lazily by the user (or a future auto-spawn-on-enable
-    // hook). Until then, sidecar probes return 401 / unavailable, which
-    // is the correct UX.
+    // Lazy-spawn the CLIProxyAPI binary the first time anyone probes or
+    // chats with a sidecar entry. Concurrent probes share one start;
+    // missing binary surfaces as `available: false` instead of crashing
+    // the bridge.
+    try {
+      sidecarSupervisor = new SidecarSupervisor();
+    } catch (e) {
+      // Most likely cause: vendor binary missing in dev. Sidecar entries
+      // will still attempt ensureRunning per-call so the error message
+      // surfaces in probe() output where the user can see it.
+      console.warn(
+        `[bridge] sidecar supervisor unavailable: ${(e as Error).message}`,
+      );
+    }
     const router = new ProviderRouter({
       registry,
-      adapters: { sidecar: createSidecarAdapter() },
+      adapters: {
+        sidecar: createSidecarAdapter({
+          ensureRunning: sidecarSupervisor
+            ? () => sidecarSupervisor!.ensureRunning()
+            : undefined,
+        }),
+      },
     });
     // Bearer token gates mutating /api/providers/* endpoints. First run
     // creates it under %LocalAppData%\OfficeAIAssistant\auth\.
@@ -491,6 +509,15 @@ async function commandServe(cli: Cli) {
 
   const shutdown = async () => {
     if (server) await server.close();
+    // Stop the sidecar binary AFTER the bridge so any in-flight
+    // adapter requests have already been aborted via dispatcher.abortAll.
+    if (sidecarSupervisor) {
+      try {
+        await sidecarSupervisor.stop();
+      } catch {
+        // best-effort: don't block shutdown on a misbehaving child
+      }
+    }
     process.exit(0);
   };
 
