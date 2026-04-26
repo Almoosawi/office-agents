@@ -1,5 +1,7 @@
 import {
   BRIDGE_PROTOCOL_VERSION,
+  type BridgeChatChunk,
+  type BridgeChatRequestPayload,
   type BridgeEventMessage,
   type BridgeHostInfo,
   type BridgeSessionSnapshot,
@@ -16,6 +18,7 @@ import {
   extractToolError,
   extractToolImages,
   extractToolText,
+  isBridgeChatChunkMessage,
   isBridgeInvokeMessage,
   normalizeBridgeUrl,
   serializeForJson,
@@ -75,10 +78,29 @@ export interface OfficeBridgeClientOptions {
   exposeGlobal?: boolean;
 }
 
+export interface BridgeChatHandle {
+  /** Same wire id the bridge stamps on every chat_chunk. */
+  readonly requestId: string;
+  /** Iterate ChatChunks until a `done` or `error` frame closes the stream. */
+  readonly chunks: AsyncIterable<BridgeChatChunk>;
+  /**
+   * Cancel the stream. Sends chat_abort over the WS; the bridge responds
+   * with a `done(abort)` chunk that closes the iterator. Safe to call
+   * multiple times.
+   */
+  abort: () => void;
+}
+
 export interface OfficeBridgeController {
   readonly enabled: boolean;
   readonly instanceId: string;
   refresh: () => Promise<BridgeSessionSnapshot | null>;
+  /**
+   * Start a chat against a registered provider. Returns a handle whose
+   * `chunks` is consumable as `for await (const c of handle.chunks)`.
+   * The bridge guarantees a terminal `done` chunk closes the stream.
+   */
+  chat: (providerId: string, request: BridgeChatRequestPayload) => BridgeChatHandle;
   stop: () => void;
 }
 
@@ -246,6 +268,136 @@ export function startOfficeBridge(
   const send = (message: BridgeWireMessage) => {
     if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
     state.socket.send(JSON.stringify(message));
+  };
+
+  // ---- chat dispatch (Module 3 wire path) ----
+  //
+  // Each call to `chat()` registers a queue here keyed by the wire
+  // requestId. Inbound chat_chunk frames push into the queue; the
+  // AsyncIterable consumer drains them. Done/error frames close the
+  // queue and remove it from this map. Socket close/reconnect flushes
+  // every pending chat with a synthetic error+done so consumers don't
+  // hang forever.
+
+  interface ChatQueue {
+    push: (chunk: BridgeChatChunk) => void;
+    close: () => void;
+  }
+  const pendingChats = new Map<string, ChatQueue>();
+
+  const flushPendingChats = (reason: string) => {
+    for (const [, queue] of pendingChats) {
+      queue.push({ kind: "error", message: reason });
+      queue.push({ kind: "done", reason: "error" });
+      queue.close();
+    }
+    pendingChats.clear();
+  };
+
+  const handleChatChunk = (
+    message: import("./protocol.js").BridgeChatChunkMessage,
+  ) => {
+    const queue = pendingChats.get(message.requestId);
+    if (!queue) return;
+    queue.push(message.chunk);
+    if (
+      message.chunk.kind === "done" ||
+      message.chunk.kind === "error"
+    ) {
+      // `error` doesn't terminate by itself — the bridge always follows
+      // it with `done`. But if we ever miss the done frame (protocol
+      // drift), close on `error` so consumers don't hang.
+      if (message.chunk.kind === "done") {
+        pendingChats.delete(message.requestId);
+        queue.close();
+      }
+    }
+  };
+
+  const startChat = (
+    providerId: string,
+    request: BridgeChatRequestPayload,
+  ): BridgeChatHandle => {
+    const requestId = createBridgeId("chat");
+
+    const queued: BridgeChatChunk[] = [];
+    let resolveNext:
+      | ((v: IteratorResult<BridgeChatChunk>) => void)
+      | null = null;
+    let closed = false;
+
+    const queue: ChatQueue = {
+      push: (chunk) => {
+        if (resolveNext) {
+          const r = resolveNext;
+          resolveNext = null;
+          r({ value: chunk, done: false });
+          return;
+        }
+        queued.push(chunk);
+      },
+      close: () => {
+        closed = true;
+        if (resolveNext) {
+          const r = resolveNext;
+          resolveNext = null;
+          r({ value: undefined as never, done: true });
+        }
+      },
+    };
+    pendingChats.set(requestId, queue);
+
+    send({
+      type: "chat_request",
+      requestId,
+      providerId,
+      request,
+    });
+
+    const chunks: AsyncIterable<BridgeChatChunk> = {
+      [Symbol.asyncIterator](): AsyncIterator<BridgeChatChunk> {
+        return {
+          next: () => {
+            if (queued.length > 0) {
+              return Promise.resolve({
+                value: queued.shift() as BridgeChatChunk,
+                done: false,
+              });
+            }
+            if (closed) {
+              return Promise.resolve({
+                value: undefined as never,
+                done: true,
+              });
+            }
+            return new Promise<IteratorResult<BridgeChatChunk>>(
+              (resolve) => {
+                resolveNext = resolve;
+              },
+            );
+          },
+          return: () => {
+            // Consumer broke out (e.g. component unmounted). Treat as
+            // an explicit abort so the bridge tears down the adapter.
+            if (!closed) {
+              send({ type: "chat_abort", requestId });
+              pendingChats.delete(requestId);
+              closed = true;
+            }
+            return Promise.resolve({ value: undefined as never, done: true });
+          },
+        };
+      },
+    };
+
+    return {
+      requestId,
+      chunks,
+      abort: () => {
+        if (closed) return;
+        send({ type: "chat_abort", requestId });
+      },
+    };
   };
 
   const sendEvent = (event: string, payload?: unknown) => {
@@ -659,6 +811,10 @@ export function startOfficeBridge(
     socket.addEventListener("message", (event) => {
       const message = parseWireMessage(event as MessageEvent<string>);
       if (!message) return;
+      if (isBridgeChatChunkMessage(message)) {
+        handleChatChunk(message);
+        return;
+      }
       handleInvoke(message);
     });
 
@@ -666,6 +822,11 @@ export function startOfficeBridge(
       if (state.socket === socket) {
         state.socket = null;
       }
+      // Any in-flight chats can't continue across a reconnect because
+      // the dispatcher state lives on the server side keyed by the old
+      // session id. Flush so consumers see a terminal frame instead of
+      // hanging.
+      flushPendingChats("bridge socket closed");
       if (state.stopped) return;
 
       clearReconnectTimer();
@@ -769,10 +930,12 @@ export function startOfficeBridge(
       if (!enabled || state.stopped) return null;
       return refresh();
     },
+    chat: startChat,
     stop: () => {
       state.stopped = true;
       clearReconnectTimer();
       teardown();
+      flushPendingChats("bridge controller stopped");
       if (state.socket) {
         state.socket.close();
         state.socket = null;

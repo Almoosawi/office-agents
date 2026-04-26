@@ -397,6 +397,16 @@ export function isBridgeChatRequestMessage(
   );
 }
 
+export function isBridgeChatChunkMessage(
+  value: unknown,
+): value is BridgeChatChunkMessage {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as BridgeChatChunkMessage).type === "chat_chunk"
+  );
+}
+
 export function isBridgeChatAbortMessage(
   value: unknown,
 ): value is BridgeChatAbortMessage {
